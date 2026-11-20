@@ -5,9 +5,9 @@
     "@akarsh"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/akarsh/ha-qubo-doorbell",
+  "documentation": "https://github.com/akarshpatil/ha-qubo-doorbell",
   "iot_class": "cloud_push",
-  "issue_tracker": "https://github.com/akarsh/ha-qubo-doorbell/issues",
+  "issue_tracker": "https://github.com/akarshpatil/ha-qubo-doorbell/issues",
   "requirements": [
     "qubopy[mqtt]==0.3.2"
   ],

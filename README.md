@@ -42,7 +42,7 @@ This integration has been developed and tested specifically with the following t
 1. Open **HACS** in your Home Assistant instance.
 2. Click the top-right three dots menu and select **Custom repositories**.
 3. Add the URL of your repository:
-   - **Repository:** `https://github.com/<your-username>/ha-qubo-doorbell`
+   - **Repository:** `https://github.com/akarshpatil/ha-qubo-doorbell`
    - **Category:** `Integration`
 4. Click **Add**, locate **Qubo (Video Doorbell & Smart Lock)**, and click **Download**.
 5. Restart Home Assistant.
