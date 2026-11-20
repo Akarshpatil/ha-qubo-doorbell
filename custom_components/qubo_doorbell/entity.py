@@ -8,6 +8,13 @@ from homeassistant.helpers.entity import Entity
 
 from .const import DOMAIN
 
+MODEL_NAMES = {
+    "HCD04C": "Video Doorbell Pro (HCD04C)",
+    "HLM04": "Smart Door Lock (HLM04)",
+}
+
+MANUFACTURER = "Qubo"
+
 
 class QuboEntity(Entity):
     """Base entity bound to one Qubo device."""
@@ -19,11 +26,15 @@ class QuboEntity(Entity):
         self._entry_id = entry_id
         self._device = device
         self._uuid = device.info.uuid
+        raw_model = (device.info.model or device.info.device_type or "Generic").upper()
+        friendly_model = MODEL_NAMES.get(raw_model, device.info.model or device.info.device_type or "Generic")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._uuid)},
             name=device.info.name,
-            manufacturer="Qubo",
-            model=device.info.model or device.info.device_type,
+            manufacturer=MANUFACTURER,
+            model=friendly_model,
+            hw_version=raw_model,
+            sw_version="1.0.0",
         )
 
 
