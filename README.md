@@ -6,6 +6,12 @@ An unofficial Home Assistant custom integration providing cloud-based live RTSPS
 
 ## Supported Devices (Tested & Verified)
 
+<p align="center">
+  <img src="images/qubo_doorbell_pro.jpg" width="280" alt="Qubo Video Doorbell Pro (HCD04C)" />
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="images/qubo_door_lock_elite.jpg" width="280" alt="Qubo Smart Door Lock Elite (HLM04)" />
+</p>
+
 This integration has been developed and tested specifically with the following two hardware models:
 
 | Device Name | Model Identifier | Type Identifier | Features Supported |
