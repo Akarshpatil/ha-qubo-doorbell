@@ -1,0 +1,15 @@
+{
+  "domain": "qubo_doorbell",
+  "name": "Qubo (Video Doorbell & Smart Lock)",
+  "codeowners": [
+    "@akarsh"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/akarsh/ha-qubo-doorbell",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/akarsh/ha-qubo-doorbell/issues",
+  "requirements": [
+    "qubopy[mqtt]==0.3.2"
+  ],
+  "version": "1.0.0"
+}

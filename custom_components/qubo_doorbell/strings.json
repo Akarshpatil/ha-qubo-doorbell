@@ -1,0 +1,51 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Qubo account",
+        "description": "Sign in with the email and password you use in the Qubo app. The session appears in the Qubo app as \"Home Assistant\".",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Qubo sign-in expired",
+        "description": "Enter your Qubo password again.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Email or password is wrong.",
+      "cannot_connect": "Could not reach the Qubo cloud.",
+      "unknown": "Unexpected error, check the logs."
+    },
+    "abort": {
+      "already_configured": "This Qubo account is already added.",
+      "reauth_successful": "Signed in again."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Snapshot history",
+        "description": "Save visitor photos and short clips into Media, in dated folders. Ring photos come from Qubo. Motion/person photos and clips are recorded from the live stream when the doorbell reports motion or a person (this briefly opens the stream, so it is skipped during a ring and while the Qubo app is viewing). Photos and clips have separate size limits; when one is exceeded, its oldest files are deleted automatically.",
+        "data": {
+          "history_enabled": "Save snapshot history",
+          "history_folder": "Folder name (inside Media)",
+          "history_max_mb": "Photo size limit (MB)",
+          "motion_snapshots": "Also save motion / person photos",
+          "motion_cooldown": "Minimum gap between motion photos (seconds)",
+          "video_enabled": "Also save short video clips on motion / person",
+          "video_seconds": "Clip length (seconds)",
+          "video_max_mb": "Video size limit (MB)"
+        }
+      }
+    },
+    "error": {
+      "invalid_folder": "Use a single folder name: letters, numbers, spaces, - _ . (no slashes)."
+    }
+  }
+}
