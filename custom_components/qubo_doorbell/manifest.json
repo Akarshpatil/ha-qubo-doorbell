@@ -2,7 +2,7 @@
   "domain": "qubo_doorbell",
   "name": "Qubo (Video Doorbell & Smart Lock)",
   "codeowners": [
-    "@akarsh"
+    "@akarshpatil"
   ],
   "config_flow": true,
   "documentation": "https://github.com/akarshpatil/ha-qubo-doorbell",

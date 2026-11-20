@@ -34,7 +34,7 @@ This integration has been developed and tested specifically with the following t
 - **Live RTSPS Video Feed:** Dynamically requests secure streaming sessions from Qubo's cloud stream manager to supply video feeds directly to Home Assistant and Apple HomeKit.
 - **Fast Snapshot Preload:** Caches high-resolution visitor snapshots in memory and local storage to deliver sub-10ms response times for instant card previews in Home Assistant dashboards and Apple Home.
 - **Doorbell Ring & Motion Sensing:** Real-time push notification listeners for doorbell button presses and motion detection events.
-- **Smart Door Lock Control:** Actuates door unlock commands routed through the paired in-home gateway with optimistic UI state updates and automatic mechanical re-lock tracking (7-second timer).
+- **Smart Door Lock Control:** Actuates door unlock commands routed through the paired in-home gateway with responsive UI state updates and automatic mechanical re-lock tracking (15-second timer).
 - **Apple HomeKit Compatibility:** Compatible with HomeKit Bridge and standalone accessory exposure.
 
 ---
