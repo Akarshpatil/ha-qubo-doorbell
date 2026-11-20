@@ -2,6 +2,12 @@
 
 An unofficial Home Assistant custom integration providing cloud-based live RTSPS streaming, instant snapshot preloading, and smart lock control for select Qubo smart home hardware.
 
+<p align="center">
+  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=Akarshpatil&repository=ha-qubo-doorbell&category=integration">
+    <img src="https://my.home-assistant.io/badges/hacs_repository.svg" alt="Open your Home Assistant instance and open a repository in HACS." />
+  </a>
+</p>
+
 ---
 
 ## Supported Devices (Tested & Verified)
@@ -45,6 +51,9 @@ This integration has been developed and tested specifically with the following t
 
 ### Method 1: HACS (Recommended)
 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Akarshpatil&repository=ha-qubo-doorbell&category=integration)
+
+Or add it manually through HACS:
 1. Open **HACS** in your Home Assistant instance.
 2. Click the top-right three dots menu and select **Custom repositories**.
 3. Add the URL of your repository:
@@ -65,7 +74,9 @@ This integration has been developed and tested specifically with the following t
 
 ## Configuration
 
-1. In Home Assistant, navigate to **Settings** -> **Devices & Services**.
+[![Open your Home Assistant instance and start setting up a new integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=qubo_doorbell)
+
+1. In Home Assistant, navigate to **Settings** -> **Devices & Services** (or click the button above).
 2. Click **Add Integration** and search for **Qubo**.
 3. Enter your Qubo account email address and password.
 4. Once authenticated, your discovered Doorbell and Smart Lock entities will appear under the integration card.
