@@ -89,6 +89,18 @@ class QuboLiveCamera(QuboEntity, Camera):
             self._async_fetch_cloud_snapshot(), "qubo_preload_snapshot"
         )
 
+        from datetime import timedelta
+        from homeassistant.helpers.event import async_track_time_interval
+
+        async def _periodic_refresh(_now: Any) -> None:
+            now = time.time()
+            if (now - self._last_image_mtime) > 600:
+                await self._async_fetch_cloud_snapshot()
+
+        self.async_on_remove(
+            async_track_time_interval(self.hass, _periodic_refresh, timedelta(minutes=10))
+        )
+
     def _read_disk_sync(self) -> tuple[bytes, float] | None:
         """Read the newest valid JPEG from disk cache synchronously."""
         candidates: list[tuple[float, str]] = []
@@ -227,40 +239,96 @@ class QuboLiveCamera(QuboEntity, Camera):
                                 created_ts,
                                 self.name,
                             )
-                            def _save():
-                                os.makedirs(os.path.dirname(self._snapshot_path), exist_ok=True)
-                                with open(self._snapshot_path, "wb") as f:
-                                    f.write(content)
-                                try:
-                                    shutil.copyfile(self._snapshot_path, self._legacy_snapshot_path)
-                                except Exception:
-                                    pass
-                                try:
-                                    www_path = self.hass.config.path("www", "qubo_visitor_latest.jpg")
-                                    os.makedirs(os.path.dirname(www_path), exist_ok=True)
-                                    shutil.copyfile(self._snapshot_path, www_path)
-                                except Exception:
-                                    pass
-                            await self.hass.async_add_executor_job(_save)
-                            self.async_write_ha_state()
+                            await self._async_save_snapshot_to_disk(content)
                             return content
         except Exception as err:
             _LOGGER.debug("Could not fetch cloud snapshot for %s: %s", self.name, err)
+
+        # Fallback to local MediaMTX gateway if stream is warm or reachable
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", 8554), timeout=0.5
+            )
+            writer.close()
+            await writer.wait_closed()
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-rtsp_transport", "tcp",
+                "-i", "rtsp://127.0.0.1:8554/qubo_local",
+                "-vframes", "1", "-q:v", "2", "-y", "/tmp/qubo_snapshot.jpg",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=6.0)
+            if os.path.isfile("/tmp/qubo_snapshot.jpg"):
+                with open("/tmp/qubo_snapshot.jpg", "rb") as f:
+                    content = f.read()
+                if content and content[:3] == b"\xff\xd8\xff":
+                    self._last_image = content
+                    self._last_image_mtime = time.time()
+                    await self._async_save_snapshot_to_disk(content)
+                    return content
+        except Exception as err:
+            _LOGGER.debug("Could not grab live frame from gateway for %s: %s", self.name, err)
+
         return self._last_image
+
+    async def _async_save_snapshot_to_disk(self, content: bytes) -> None:
+        """Persist snapshot content to all cache paths asynchronously."""
+        def _save():
+            os.makedirs(os.path.dirname(self._snapshot_path), exist_ok=True)
+            with open(self._snapshot_path, "wb") as f:
+                f.write(content)
+            try:
+                shutil.copyfile(self._snapshot_path, self._legacy_snapshot_path)
+            except Exception:
+                pass
+            try:
+                www_path = self.hass.config.path("www", "qubo_visitor_latest.jpg")
+                os.makedirs(os.path.dirname(www_path), exist_ok=True)
+                shutil.copyfile(self._snapshot_path, www_path)
+            except Exception:
+                pass
+        await self.hass.async_add_executor_job(_save)
+        self.async_write_ha_state()
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         """Return the preloaded snapshot instantly for Apple Home and UI preview without starting a video stream."""
+        # 1. Check if p2p_streamer wrote a fresh live frame to /tmp/qubo_snapshot.jpg
+        tmp_snap = "/tmp/qubo_snapshot.jpg"
+        if os.path.isfile(tmp_snap):
+            try:
+                mtime = os.path.getmtime(tmp_snap)
+                if mtime > self._last_image_mtime:
+                    with open(tmp_snap, "rb") as f:
+                        data = f.read()
+                    if data and data[:3] == b"\xff\xd8\xff":
+                        self._last_image = data
+                        self._last_image_mtime = mtime
+                        self.hass.async_create_background_task(
+                            self._async_save_snapshot_to_disk(data), "qubo_save_snap"
+                        )
+                        return self._last_image
+            except Exception:
+                pass
+
+        # 2. Check if active stream has a fresh frame
         if self.stream and getattr(self.stream, "available", False):
             try:
                 frame = await self.stream.async_get_image(width=width, height=height)
                 if frame:
                     self._last_image = frame
+                    self._last_image_mtime = time.time()
+                    self.hass.async_create_background_task(
+                        self._async_save_snapshot_to_disk(frame), "qubo_save_snap"
+                    )
                     return frame
             except Exception as err:
                 _LOGGER.debug("Error grabbing frame from stream: %s", err)
 
+        # 3. Check disk cache
         disk_mtime = await self.hass.async_add_executor_job(self._get_disk_mtime_sync)
         if disk_mtime > self._last_image_mtime or not self._last_image:
             fresh = await self.hass.async_add_executor_job(self._read_disk_sync)
@@ -268,12 +336,13 @@ class QuboLiveCamera(QuboEntity, Camera):
                 self._last_image, self._last_image_mtime = fresh
                 return self._last_image
 
-        if self._last_image:
-            return self._last_image
+        # 4. If image is older than 10 minutes, schedule background refresh
+        now = time.time()
+        if (now - self._last_image_mtime) > 600 and (now - self._last_cloud_fetch) > 300:
+            self.hass.async_create_background_task(
+                self._async_fetch_cloud_snapshot(), "qubo_periodic_snapshot_refresh"
+            )
 
-        self.hass.async_create_background_task(
-            self._async_fetch_cloud_snapshot(), "qubo_fetch_snapshot_fallback"
-        )
         return self._last_image
 
     async def async_create_stream(self) -> Stream | None:

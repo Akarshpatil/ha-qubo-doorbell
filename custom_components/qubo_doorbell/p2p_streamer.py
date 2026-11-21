@@ -238,6 +238,10 @@ class QuboP2PStreamer:
             "-rtsp_transport", "tcp",
             "-f", "rtsp",
             self.rtsp_target,
+            "-map", "0:v:0",
+            "-r", "1/5",
+            "-update", "1",
+            "-y", "/tmp/qubo_snapshot.jpg",
         ]
         _LOGGER.info("Starting low-latency A/V FFmpeg RTSP publisher: %s", " ".join(cmd))
         self.ffmpeg_proc = subprocess.Popen(

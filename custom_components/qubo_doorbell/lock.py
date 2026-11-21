@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from typing import Any
 
 from homeassistant.components.lock import LockEntity, LockEntityFeature
@@ -60,6 +62,49 @@ class QuboLockEntity(QuboEntity, LockEntity):
         self._token: str | None = None
         self._pin: str | None = None
         self._unlock_task: asyncio.Task[None] | None = None
+        self._load_cached_credentials()
+
+    def _get_cache_path(self) -> str:
+        """Return path to persistent cache file."""
+        return self.hass.config.path(".storage", "qubo_p2p_cache.json")
+
+    def _load_cached_credentials(self) -> None:
+        """Load cached lock actuation credentials for zero-latency instant unlock."""
+        try:
+            cache_file = self._get_cache_path()
+            if os.path.isfile(cache_file):
+                with open(cache_file, "r") as f:
+                    data = json.load(f)
+                lock_data = data.get("lock", {})
+                if lock_data.get("token"):
+                    self._token = str(lock_data["token"])
+                if lock_data.get("pin"):
+                    self._pin = str(lock_data["pin"])
+                if lock_data.get("gateway_id") and not self._gateway_id:
+                    self._gateway_id = str(lock_data["gateway_id"])
+                _LOGGER.debug("Loaded cached lock credentials for %s (gw: %s)", self._uuid, self._gateway_id)
+        except Exception as err:
+            _LOGGER.debug("Could not load cached lock credentials: %s", err)
+
+    def _save_cached_credentials(self) -> None:
+        """Save extracted lock credentials to persistent cache."""
+        try:
+            cache_file = self._get_cache_path()
+            data = {}
+            if os.path.isfile(cache_file):
+                with open(cache_file, "r") as f:
+                    data = json.load(f)
+            data["lock"] = {
+                "token": self._token,
+                "pin": self._pin,
+                "gateway_id": self._gateway_id,
+                "lock_id": self._uuid,
+            }
+            with open(cache_file, "w") as f:
+                json.dump(data, f, indent=2)
+            _LOGGER.debug("Persisted lock credentials to cache for instant unlock")
+        except Exception as err:
+            _LOGGER.debug("Could not save lock credentials: %s", err)
 
     @property
     def is_locked(self) -> bool:
@@ -155,6 +200,9 @@ class QuboLockEntity(QuboEntity, LockEntity):
         )
         if pin:
             self._pin = str(pin)
+
+        if self._token and self._pin:
+            self._save_cached_credentials()
 
     @callback
     def _handle_event(self, data: dict[str, Any]) -> None:

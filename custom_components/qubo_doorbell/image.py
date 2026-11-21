@@ -86,6 +86,14 @@ class QuboSnapshotImage(QuboEntity, ImageEntity):
         )
 
     async def async_image(self) -> bytes | None:
+        # Check if disk file has a newer mtime
+        stored = await self.hass.async_add_executor_job(_read_file, self._path)
+        if stored:
+            data, mtime = stored
+            if not hasattr(self, "_last_mtime") or mtime > self._last_mtime:
+                self._image = data
+                self._last_mtime = mtime
+                self._attr_image_last_updated = datetime.fromtimestamp(mtime, timezone.utc)
         return self._image
 
     @callback
