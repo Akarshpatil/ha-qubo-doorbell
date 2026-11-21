@@ -173,6 +173,12 @@ class QuboLiveCamera(QuboEntity, Camera):
                                 shutil.copyfile(self._snapshot_path, self._legacy_snapshot_path)
                             except Exception:
                                 pass
+                            try:
+                                www_path = self.hass.config.path("www", "qubo_visitor_latest.jpg")
+                                os.makedirs(os.path.dirname(www_path), exist_ok=True)
+                                shutil.copyfile(self._snapshot_path, www_path)
+                            except Exception:
+                                pass
                         await self.hass.async_add_executor_job(_save)
                         self.async_write_ha_state()
                         self.hass.async_create_background_task(
@@ -223,6 +229,12 @@ class QuboLiveCamera(QuboEntity, Camera):
                                     f.write(content)
                                 try:
                                     shutil.copyfile(self._snapshot_path, self._legacy_snapshot_path)
+                                except Exception:
+                                    pass
+                                try:
+                                    www_path = self.hass.config.path("www", "qubo_visitor_latest.jpg")
+                                    os.makedirs(os.path.dirname(www_path), exist_ok=True)
+                                    shutil.copyfile(self._snapshot_path, www_path)
                                 except Exception:
                                     pass
                             await self.hass.async_add_executor_job(_save)

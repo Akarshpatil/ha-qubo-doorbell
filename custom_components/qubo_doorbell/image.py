@@ -121,10 +121,15 @@ class QuboSnapshotImage(QuboEntity, ImageEntity):
             _LOGGER.warning("Qubo snapshot is not a JPEG/PNG image (%d bytes)", len(data))
             return
         alt_path = self.hass.config.path(DOMAIN, f"{self._uuid}_snapshot.jpg")
+        www_path = self.hass.config.path("www", "qubo_visitor_latest.jpg")
         def _write_both():
             _write_file(self._path, data)
             try:
                 _write_file(alt_path, data)
+            except Exception:
+                pass
+            try:
+                _write_file(www_path, data)
             except Exception:
                 pass
         await self.hass.async_add_executor_job(_write_both)
