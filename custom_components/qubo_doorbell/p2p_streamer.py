@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Qubo Video Doorbell Local P2P Video Streamer.
+"""Qubo Video Doorbell Local P2P Video & Audio Streamer.
 
 Direct LAN media bridge: Doorbell (UDP) -> Host -> MediaMTX / go2rtc (RTSP)
 - Negotiates P2P UDP candidate via Qubo Cloud API (p2pCall)
 - Handles ICE/STUN binding & USE-CANDIDATE nomination
 - Maintains ICE consent freshness keepalives
-- Decrypts AES-128-GCM RTP video payload (Dynamic PT 96) in real-time
-- Reassembles H.264 Annex B NAL units (FU-A and single NALs)
-- Direct low-latency passthrough into RTSP server via FFmpeg
+- Decrypts AES-128-GCM RTP video payload (Dynamic PT 96, H.264 Baseline) in real-time
+- Decrypts AES-128-GCM RTP audio payload (Dynamic PT 97, AAC-LC 16kHz) in real-time
+- Decoupled localhost RTP forwarder with dynamic SDP manifest for zero-latency, deadlock-free A/V ingestion
+- Direct low-latency A/V passthrough into RTSP server via FFmpeg (-c:v copy -c:a copy)
 - Gracefully releases camera hardware encoder on teardown to preserve battery & extinguish blue LED
 - Automatically discovers credentials, device IDs, and local network IP from Home Assistant
 - Caches authentication tokens and SPS/PPS for sub-second stream startup
@@ -44,10 +45,20 @@ _LOGGER = logging.getLogger("qubo_p2p")
 MAGIC_COOKIE = b"\x24\x4a\x21\x12"
 DEFAULT_LOCAL_PORT = 49700
 DEFAULT_RTSP_TARGET = "rtsp://127.0.0.1:8554/qubo_local"
+DEFAULT_RTP_VIDEO_PORT = 5004
+DEFAULT_RTP_AUDIO_PORT = 5006
 
-# Default SPS/PPS for Qubo Video Doorbell Pro (HCD04C 2K) to eliminate probe latency
-DEFAULT_SPS = bytes.fromhex("000000016742c028d900540507a0220000030002000003007908")
-DEFAULT_PPS = bytes.fromhex("0000000168ce3c80")
+SDP_TEMPLATE = """v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=Qubo
+c=IN IP4 127.0.0.1
+t=0 0
+m=video {video_port} RTP/AVP 96
+a=rtpmap:96 H264/90000
+m=audio {audio_port} RTP/AVP 97
+a=rtpmap:97 MPEG4-GENERIC/16000/1
+a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1408
+"""
 
 
 def get_default_local_ip() -> str:
@@ -135,6 +146,8 @@ class QuboP2PStreamer:
         local_ip: str | None = None,
         local_port: int = DEFAULT_LOCAL_PORT,
         rtsp_target: str = DEFAULT_RTSP_TARGET,
+        rtp_video_port: int = DEFAULT_RTP_VIDEO_PORT,
+        rtp_audio_port: int = DEFAULT_RTP_AUDIO_PORT,
         config_dir: str | None = None,
     ) -> None:
         self.email = email
@@ -145,13 +158,17 @@ class QuboP2PStreamer:
         self.local_ip = local_ip or get_default_local_ip()
         self.local_port = local_port
         self.rtsp_target = rtsp_target
+        self.rtp_video_port = rtp_video_port
+        self.rtp_audio_port = rtp_audio_port
         self.config_dir = config_dir or find_ha_config_dir()
+        self.sdp_path = f"/tmp/qubo_{self.local_port}.sdp"
 
         self.key = os.urandom(16)
         self.iv = os.urandom(16)
         self.aesgcm = AESGCM(self.key)
 
         self.sock: socket.socket | None = None
+        self.out_sock: socket.socket | None = None
         self.client: QuboClient | None = None
         self.session: aiohttp.ClientSession | None = None
         self.user_app_id = f"ha_p2p_{os.urandom(4).hex()}"
@@ -162,12 +179,7 @@ class QuboP2PStreamer:
         self.stopped = False
         self.roc = 0
         self.last_seq: int | None = None
-        self.fu_buffer = bytearray()
         self.last_keepalive = 0.0
-
-        # SPS / PPS state
-        self.sps = DEFAULT_SPS
-        self.pps = DEFAULT_PPS
 
     def _get_cache_path(self) -> str:
         """Return path to persistent cache file."""
@@ -201,44 +213,39 @@ class QuboP2PStreamer:
             _LOGGER.debug("Could not save cache: %s", e)
 
     def start_ffmpeg(self) -> None:
-        """Launch low-latency FFmpeg publisher piping Annex B stream into RTSP server."""
+        """Launch ultra-low-latency FFmpeg publisher piping decoupled RTP streams into RTSP server."""
+        # Generate SDP manifest for FFmpeg RTP demuxer
+        sdp_content = SDP_TEMPLATE.format(
+            video_port=self.rtp_video_port,
+            audio_port=self.rtp_audio_port,
+        )
+        with open(self.sdp_path, "w") as f:
+            f.write(sdp_content)
+
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "warning",
-            "-probesize", "4096",
-            "-analyzeduration", "50000",
+            "-protocol_whitelist", "file,udp,rtp",
+            "-probesize", "32768",
+            "-analyzeduration", "100000",
             "-fpsprobesize", "0",
             "-fflags", "nobuffer+flush_packets",
             "-flags", "low_delay",
-            "-use_wallclock_as_timestamps", "1",
-            "-f", "h264",
-            "-r", "10",
-            "-i", "pipe:0",
+            "-i", self.sdp_path,
             "-c:v", "copy",
-            "-an",
-            "-muxdelay", "0.01",
-            "-max_interleave_delta", "0",
+            "-c:a", "copy",
             "-rtsp_transport", "tcp",
             "-f", "rtsp",
             self.rtsp_target,
         ]
-        _LOGGER.info("Starting low-latency FFmpeg RTSP publisher: %s", " ".join(cmd))
+        _LOGGER.info("Starting low-latency A/V FFmpeg RTSP publisher: %s", " ".join(cmd))
         self.ffmpeg_proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-
-        # Pre-seed FFmpeg with SPS + PPS so probe succeeds in <50ms without waiting for camera IDR
-        if self.sps and self.pps and self.ffmpeg_proc and self.ffmpeg_proc.stdin:
-            try:
-                self.ffmpeg_proc.stdin.write(self.sps + self.pps)
-                self.ffmpeg_proc.stdin.flush()
-                _LOGGER.debug("Pre-seeded FFmpeg with SPS/PPS for instant probe")
-            except Exception as e:
-                _LOGGER.debug("Pre-seeding notice: %s", e)
 
     def send_stun_response(self, tid: bytes, addr: tuple[str, int]) -> None:
         """Send authenticated STUN Binding Success response."""
@@ -276,13 +283,9 @@ class QuboP2PStreamer:
         self.sock.bind(("0.0.0.0", self.local_port))
         self.sock.setblocking(False)
 
+        self.out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
         cache = self._load_cache()
-        if cache.get("sps_b64") and cache.get("pps_b64"):
-            try:
-                self.sps = base64.b64decode(cache["sps_b64"])
-                self.pps = base64.b64decode(cache["pps_b64"])
-            except Exception:
-                pass
 
         if not self.unit_uuid and cache.get("unit_uuid"):
             self.unit_uuid = cache["unit_uuid"]
@@ -383,83 +386,46 @@ class QuboP2PStreamer:
                         if len(data) < 28:
                             continue
                         pt = data[1] & 0x7F
-                        seq = struct.unpack("!H", data[2:4])[0]
-
-                        # Rollover counter tracking
-                        if self.last_seq is not None:
-                            if seq < self.last_seq and (self.last_seq - seq) > 30000:
-                                self.roc += 1
-                        self.last_seq = seq
-
-                        if pt != 96:
-                            continue
-
-                        # AES-128-GCM Decryption
                         aad = data[:12]
                         ciphertext = data[12:-16]
                         tag = data[-16:]
 
-                        temp_iv = data[:12] + struct.pack("!I", self.roc)
-                        derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
+                        # Track video stream (PT 96: H.264 Baseline)
+                        if pt == 96:
+                            seq = struct.unpack("!H", data[2:4])[0]
+                            if self.last_seq is not None:
+                                if seq < self.last_seq and (self.last_seq - seq) > 30000:
+                                    self.roc += 1
+                            self.last_seq = seq
 
-                        try:
-                            plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
-                            if not plaintext:
-                                continue
+                            temp_iv = data[:12] + struct.pack("!I", self.roc)
+                            derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
 
-                            nal_header = plaintext[0]
-                            nal_type = nal_header & 0x1F
-
-                            if nal_type == 7:  # SPS
-                                self.sps = b"\x00\x00\x00\x01" + plaintext
-                                self._save_cache({"sps_b64": base64.b64encode(self.sps).decode("ascii")})
-                            elif nal_type == 8:  # PPS
-                                self.pps = b"\x00\x00\x00\x01" + plaintext
-                                self._save_cache({"pps_b64": base64.b64encode(self.pps).decode("ascii")})
-
-                            if 1 <= nal_type <= 23:
-                                # Single NAL Unit
-                                if first_frame:
-                                    _LOGGER.info(
-                                        "First H.264 NAL received (type=%d, len=%d). Live stream established!",
-                                        nal_type,
-                                        len(plaintext),
-                                    )
-                                    first_frame = False
-                                if self.ffmpeg_proc and self.ffmpeg_proc.stdin:
-                                    self.ffmpeg_proc.stdin.write(b"\x00\x00\x00\x01" + plaintext)
-                                    self.ffmpeg_proc.stdin.flush()
-                            elif nal_type == 28:  # FU-A fragmented slice
-                                fu_indicator = nal_header
-                                fu_header = plaintext[1]
-                                start_bit = fu_header & 0x80
-                                end_bit = fu_header & 0x40
-                                fu_type = fu_header & 0x1F
-
-                                if start_bit:
-                                    self.fu_buffer = bytearray(b"\x00\x00\x00\x01")
-                                    reconstructed_nal = (fu_indicator & 0xE0) | fu_type
-                                    self.fu_buffer.append(reconstructed_nal)
-                                    self.fu_buffer.extend(plaintext[2:])
-                                else:
-                                    if self.fu_buffer:
-                                        self.fu_buffer.extend(plaintext[2:])
-
-                                if end_bit and self.fu_buffer:
+                            try:
+                                plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
+                                if plaintext:
                                     if first_frame:
-                                        _LOGGER.info(
-                                            "First fragmented NAL reassembled (type=%d, len=%d). Live stream established!",
-                                            fu_type,
-                                            len(self.fu_buffer),
-                                        )
+                                        _LOGGER.info("First H.264 video RTP packet decrypted. Live stream established!")
                                         first_frame = False
-                                    if self.ffmpeg_proc and self.ffmpeg_proc.stdin:
-                                        self.ffmpeg_proc.stdin.write(self.fu_buffer)
-                                        self.ffmpeg_proc.stdin.flush()
-                                    self.fu_buffer = bytearray()
+                                    if self.out_sock:
+                                        self.out_sock.sendto(
+                                            data[:12] + plaintext, ("127.0.0.1", self.rtp_video_port)
+                                        )
+                            except Exception:
+                                pass
 
-                        except Exception:
-                            pass
+                        # Track audio stream (PT 97: AAC-LC 16kHz)
+                        elif pt == 97:
+                            temp_iv = data[:12] + b"\x00\x00\x00\x00"
+                            derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
+                            try:
+                                plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
+                                if plaintext and self.out_sock:
+                                    self.out_sock.sendto(
+                                        data[:12] + plaintext, ("127.0.0.1", self.rtp_audio_port)
+                                    )
+                            except Exception:
+                                pass
 
                     # Keepalive consent freshness every 1.5s
                     if self.camera_addr and (now - self.last_keepalive) > 1.5:
@@ -488,18 +454,34 @@ class QuboP2PStreamer:
 
         if self.ffmpeg_proc:
             try:
-                if self.ffmpeg_proc.stdin:
-                    self.ffmpeg_proc.stdin.close()
                 self.ffmpeg_proc.terminate()
-                self.ffmpeg_proc.wait(timeout=2.0)
+                self.ffmpeg_proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.ffmpeg_proc.kill()
+                except Exception:
+                    pass
+            self.ffmpeg_proc = None
+
+        if self.out_sock:
+            try:
+                self.out_sock.close()
             except Exception:
                 pass
+            self.out_sock = None
 
         if self.sock:
             try:
                 self.sock.close()
             except Exception:
                 pass
+            self.sock = None
+
+        try:
+            if os.path.exists(self.sdp_path):
+                os.remove(self.sdp_path)
+        except Exception:
+            pass
 
         # Release session with Qubo cloud API so camera blue LED turns off
         if self.client and hasattr(self.client, "request") and self.unit_uuid and self.device_uuid:
@@ -531,6 +513,8 @@ def main() -> None:
     parser.add_argument("--local-ip", help="Host LAN IP address (auto-detected if omitted)")
     parser.add_argument("--local-port", type=int, default=DEFAULT_LOCAL_PORT, help="Local UDP port (default: 49700)")
     parser.add_argument("--rtsp-target", default=DEFAULT_RTSP_TARGET, help="RTSP publish target URL")
+    parser.add_argument("--rtp-video-port", type=int, default=DEFAULT_RTP_VIDEO_PORT, help="RTP Video port (default: 5004)")
+    parser.add_argument("--rtp-audio-port", type=int, default=DEFAULT_RTP_AUDIO_PORT, help="RTP Audio port (default: 5006)")
 
     args = parser.parse_args()
 
@@ -563,6 +547,8 @@ def main() -> None:
         local_ip=args.local_ip,
         local_port=args.local_port,
         rtsp_target=args.rtsp_target,
+        rtp_video_port=args.rtp_video_port,
+        rtp_audio_port=args.rtp_audio_port,
         config_dir=config_dir,
     )
 

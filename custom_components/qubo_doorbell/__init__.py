@@ -57,7 +57,8 @@ def _patch_homekit_camera_lifecycle() -> None:
                 if self.config.get(CONF_VIDEO_CODEC) != "copy":
                     self.config[CONF_VIDEO_CODEC] = "copy"
                     _LOGGER.debug("Enforced video_codec='copy' for %s for zero transcoding latency", self.entity_id)
-                self.config[CONF_SUPPORT_AUDIO] = False
+                # Enable live camera listening audio
+                self.config[CONF_SUPPORT_AUDIO] = True
 
         async def _qubo_get_stream_source(self: Any) -> str | None:
             src = await _orig_get_stream_source(self)
@@ -65,9 +66,13 @@ def _patch_homekit_camera_lifecycle() -> None:
                 return src
             is_qubo = "qubo" in getattr(self, "platform", "").lower() or "qubo" in getattr(self, "entity_id", "").lower() or "qubo" in src.lower()
             if is_qubo:
-                # Force TCP transport and zero buffering to eliminate 4-second UDP timeout
-                if "-rtsp_transport tcp" not in src:
-                    src = f"-fflags nobuffer -flags low_delay -rtsp_transport tcp -i {src}"
+                # Extract raw RTSP URL if input options are already attached
+                target_url = src.split("-i ")[-1].strip() if "-i " in src else src
+                # Enforce ultra-fast stream probing and zero-buffering low-delay transport
+                src = (
+                    f"-probesize 32768 -analyzeduration 100000 -fpsprobesize 0 "
+                    f"-fflags nobuffer+flush_packets -flags low_delay -rtsp_transport tcp -i {target_url}"
+                )
             return src
 
         async def _doorbell_aware_stop_stream(self: Any, session_info: dict[str, Any]) -> None:
