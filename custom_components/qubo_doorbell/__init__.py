@@ -24,6 +24,43 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.IMAGE, Platform.LOCK, Platform.CAMERA]
 
 
+def _patch_homekit_doorbell_category() -> None:
+    """Ensure HomeKit camera accessories with linked doorbells advertise as CATEGORY_VIDEO_DOOR_BELL (18).
+
+    By default, Home Assistant core's type_cameras.Camera hardcodes category=CATEGORY_CAMERA (17).
+    This prevents Apple Home from detecting the accessory as a native Video Doorbell (Robin ProLine,
+    Logitech Circle View, Belkin Wemo), hiding HomePod chime settings, doorbell notifications,
+    and native smart lock linking.
+    """
+    try:
+        from homeassistant.components.homekit import type_cameras
+        from homeassistant.components.homekit.const import CONF_LINKED_DOORBELL_SENSOR
+        from pyhap.const import CATEGORY_VIDEO_DOOR_BELL
+
+        if getattr(type_cameras.Camera, "_qubo_doorbell_patched", False):
+            return
+
+        _orig_init = type_cameras.Camera.__init__
+
+        def _doorbell_aware_init(self: Any, *args: Any, **kwargs: Any) -> None:
+            _orig_init(self, *args, **kwargs)
+            if self.config.get(CONF_LINKED_DOORBELL_SENSOR):
+                self.category = CATEGORY_VIDEO_DOOR_BELL
+                _LOGGER.info(
+                    "HomeKit camera accessory '%s' configured with linked doorbell: Set category to CATEGORY_VIDEO_DOOR_BELL (18)",
+                    getattr(self, "display_name", self.entity_id),
+                )
+
+        type_cameras.Camera.__init__ = _doorbell_aware_init
+        type_cameras.Camera._qubo_doorbell_patched = True
+        _LOGGER.debug("Applied HomeKit CATEGORY_VIDEO_DOOR_BELL runtime patch")
+    except Exception as err:
+        _LOGGER.debug("Could not apply HomeKit doorbell category patch: %s", err)
+
+
+_patch_homekit_doorbell_category()
+
+
 class QuboRuntime:
     """Holds the live Qubo session for one config entry."""
 
@@ -38,6 +75,7 @@ class QuboRuntime:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Log in, discover devices and start the real-time event listener."""
+    _patch_homekit_doorbell_category()
     session = async_get_clientsession(hass)
     auth = QuboAuth(device_id=entry.data[CONF_DEVICE_ID], session=session)
     try:
