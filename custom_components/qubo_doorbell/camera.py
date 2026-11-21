@@ -175,6 +175,9 @@ class QuboLiveCamera(QuboEntity, Camera):
                                 pass
                         await self.hass.async_add_executor_job(_save)
                         self.async_write_ha_state()
+                        self.hass.async_create_background_task(
+                            self._async_notify_mediamtx_reload(), "qubo_mediamtx_reload"
+                        )
                         _LOGGER.info("Updated Qubo snapshot for %s (%d bytes)", self.name, len(content))
                         return content
         except Exception as err:
@@ -224,6 +227,9 @@ class QuboLiveCamera(QuboEntity, Camera):
                                     pass
                             await self.hass.async_add_executor_job(_save)
                             self.async_write_ha_state()
+                            self.hass.async_create_background_task(
+                                self._async_notify_mediamtx_reload(), "qubo_mediamtx_reload"
+                            )
                             return content
         except Exception as err:
             _LOGGER.debug("Could not fetch cloud snapshot for %s: %s", self.name, err)
@@ -269,10 +275,24 @@ class QuboLiveCamera(QuboEntity, Camera):
                 self.stream = None
         return await super().async_create_stream()
 
+    async def _async_notify_mediamtx_reload(self) -> None:
+        """Notify MediaMTX to reload qubo on-demand stream with the fresh snapshot."""
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.patch(
+                "http://127.0.0.1:9997/v3/config/paths/patch/qubo",
+                json={},
+                timeout=aiohttp.ClientTimeout(total=2),
+            ) as resp:
+                if resp.status == 200:
+                    _LOGGER.debug("MediaMTX reloaded qubo live stream")
+        except Exception:
+            pass
+
     async def stream_source(self) -> str | None:
-        """Mint a fresh live RTSPS stream URL with fast hardware handoff or provide reliable HomeKit fallback."""
+        """Mint a fresh live RTSPS stream URL with fast hardware handoff or provide reliable local fallback."""
         async with self._stream_lock:
-            # 1. Attempt live Wowza RTSPS stream
+            # 1. Attempt live Wowza RTSPS stream from Qubo Cloud
             try:
                 session_id = str(uuid.uuid4())
                 _LOGGER.debug("Requesting cloud RTSPS stream for %s (userAppID=%s)", self._uuid, session_id)
@@ -284,10 +304,21 @@ class QuboLiveCamera(QuboEntity, Camera):
                     return stream_url
             except Exception as err:
                 _LOGGER.info(
-                    "Cloud stream for %s unavailable (%s); using HomeKit snapshot stream",
+                    "Cloud stream for %s unavailable (%s); using local fallback stream",
                     self.name,
                     err,
                 )
+
+            # 2. Check if local mediamtx RTSP gateway is listening
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection("127.0.0.1", 8554), timeout=1.0
+                )
+                writer.close()
+                await writer.wait_closed()
+                return "rtsp://127.0.0.1:8554/qubo"
+            except Exception:
+                _LOGGER.debug("Local RTSP gateway at 127.0.0.1:8554 not reachable")
 
             return None
 
