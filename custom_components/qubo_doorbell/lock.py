@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 from typing import Any
 
 from homeassistant.components.lock import LockEntity, LockEntityFeature
@@ -59,52 +57,7 @@ class QuboLockEntity(QuboEntity, LockEntity):
         self._is_unlocking: bool = False
         self._gateway_id: str | None = getattr(device, "gateway_id", None)
         self._relock_timer: asyncio.TimerHandle | None = None
-        self._token: str | None = None
-        self._pin: str | None = None
         self._unlock_task: asyncio.Task[None] | None = None
-        self._load_cached_credentials()
-
-    def _get_cache_path(self) -> str:
-        """Return path to persistent cache file."""
-        return self.hass.config.path(".storage", "qubo_p2p_cache.json")
-
-    def _load_cached_credentials(self) -> None:
-        """Load cached lock actuation credentials for zero-latency instant unlock."""
-        try:
-            cache_file = self._get_cache_path()
-            if os.path.isfile(cache_file):
-                with open(cache_file, "r") as f:
-                    data = json.load(f)
-                lock_data = data.get("lock", {})
-                if lock_data.get("token"):
-                    self._token = str(lock_data["token"])
-                if lock_data.get("pin"):
-                    self._pin = str(lock_data["pin"])
-                if lock_data.get("gateway_id") and not self._gateway_id:
-                    self._gateway_id = str(lock_data["gateway_id"])
-                _LOGGER.debug("Loaded cached lock credentials for %s (gw: %s)", self._uuid, self._gateway_id)
-        except Exception as err:
-            _LOGGER.debug("Could not load cached lock credentials: %s", err)
-
-    def _save_cached_credentials(self) -> None:
-        """Save extracted lock credentials to persistent cache."""
-        try:
-            cache_file = self._get_cache_path()
-            data = {}
-            if os.path.isfile(cache_file):
-                with open(cache_file, "r") as f:
-                    data = json.load(f)
-            data["lock"] = {
-                "token": self._token,
-                "pin": self._pin,
-                "gateway_id": self._gateway_id,
-                "lock_id": self._uuid,
-            }
-            with open(cache_file, "w") as f:
-                json.dump(data, f, indent=2)
-            _LOGGER.debug("Persisted lock credentials to cache for instant unlock")
-        except Exception as err:
-            _LOGGER.debug("Could not save lock credentials: %s", err)
 
     @property
     def is_locked(self) -> bool:
@@ -141,13 +94,21 @@ class QuboLockEntity(QuboEntity, LockEntity):
         self.hass.async_create_task(self._async_initial_refresh(), "qubo_lock_refresh")
 
     async def _async_initial_refresh(self) -> None:
-        """Prefetch lock credentials and status from shadow."""
+        """Prefetch lock status from shadow."""
         if hasattr(self._lock_device, "refresh"):
             try:
                 await self._lock_device.refresh()
-                self._update_credentials_from_shadow()
                 if not self._gateway_id:
                     self._gateway_id = getattr(self._lock_device, "gateway_id", None)
+                if not self._gateway_id:
+                    rt = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+                    if rt:
+                        for dev in rt.devices:
+                            m = (getattr(dev.info, "model", None) or "").upper()
+                            t = (getattr(dev.info, "device_type", None) or "").upper()
+                            if "DOORBELL" in t or "CAMERA" in t or m.startswith("HCD"):
+                                self._gateway_id = getattr(dev, "device_id", dev.info.uuid)
+                                break
                 if hasattr(self._lock_device, "fetch_live_lock_state"):
                     try:
                         live_st = await self._lock_device.fetch_live_lock_state()
@@ -163,46 +124,6 @@ class QuboLockEntity(QuboEntity, LockEntity):
                 self.async_write_ha_state()
             except Exception as err:
                 _LOGGER.debug("Initial lock shadow refresh deferred for %s: %s", self._uuid, err)
-
-    def _update_credentials_from_shadow(self) -> None:
-        """Extract lock actuation token and PIN dynamically from device shadow."""
-        if not (hasattr(self._lock_device, "shadow") and hasattr(self._lock_device.shadow, "reported")):
-            return
-        rep = self._lock_device.shadow.reported or {}
-        st = (
-            rep.get("lockControl_lockState")
-            or (rep.get("lockControl", {}).get("lockState") if isinstance(rep.get("lockControl"), dict) else None)
-            or rep.get("lockState")
-        )
-        if st is not None:
-            s = str(st).strip().lower()
-            if s in ("locked", "lock"):
-                self._is_locked = True
-            elif s in ("unlocked", "unlock"):
-                self._is_locked = False
-
-        # Dynamic token extraction
-        token = (
-            rep.get("token")
-            or rep.get("lockControl_token")
-            or (rep.get("lockControl", {}).get("token") if isinstance(rep.get("lockControl"), dict) else None)
-        )
-        if token:
-            self._token = str(token)
-
-        # Dynamic PIN extraction (Google Assistant / Alexa remote PIN or Master PIN)
-        pin = (
-            rep.get("pin")
-            or rep.get("googleAssistantPin_pin")
-            or (rep.get("googleAssistantPin", {}).get("pin") if isinstance(rep.get("googleAssistantPin"), dict) else None)
-            or rep.get("masterPinControl_pin")
-            or (rep.get("masterPinControl", {}).get("pin") if isinstance(rep.get("masterPinControl"), dict) else None)
-        )
-        if pin:
-            self._pin = str(pin)
-
-        if self._token and self._pin:
-            self._save_cached_credentials()
 
     @callback
     def _handle_event(self, data: dict[str, Any]) -> None:
@@ -237,7 +158,7 @@ class QuboLockEntity(QuboEntity, LockEntity):
             self._relock_timer.cancel()
 
         @callback
-        def _relock():
+        def _relock() -> None:
             _LOGGER.info("Qubo lock %s auto-relocked mechanically to locked state", self._uuid)
             self._is_locked = True
             self._is_unlocking = False
@@ -258,94 +179,46 @@ class QuboLockEntity(QuboEntity, LockEntity):
         self.async_write_ha_state()
 
         # Send command asynchronously in background
-        code = kwargs.get("code")
         self._unlock_task = self.hass.async_create_task(
-            self._async_dispatch_unlock(code=code), "qubo_unlock_dispatch"
+            self._async_dispatch_unlock(), "qubo_unlock_dispatch"
         )
 
-    async def _async_dispatch_unlock(self, code: str | None = None) -> None:
+    async def _async_dispatch_unlock(self) -> None:
         """Execute unlock payload via paired in-home gateway (VDB)."""
-        client = getattr(self._lock_device, "client", None)
         target_gw = self._gateway_id or getattr(self._lock_device, "gateway_id", None)
-        unit_id = getattr(self._lock_device, "unit_id", None)
-        entity_id = getattr(self._lock_device, "entity_id", None)
+        if not target_gw:
+            rt = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+            if rt:
+                for dev in rt.devices:
+                    m = (getattr(dev.info, "model", None) or "").upper()
+                    t = (getattr(dev.info, "device_type", None) or "").upper()
+                    if "DOORBELL" in t or "CAMERA" in t or m.startswith("HCD"):
+                        target_gw = getattr(dev, "device_id", dev.info.uuid)
+                        self._gateway_id = target_gw
+                        break
 
-        if not (client and unit_id and entity_id and target_gw):
-            _LOGGER.error("Missing required binding for lock %s (gw: %s)", self._uuid, target_gw)
+        if not target_gw:
+            _LOGGER.error("Missing required gateway binding for lock %s", self._uuid)
             self._is_unlocking = False
             self._is_locked = True
             self.async_write_ha_state()
             return
 
-        from qubopy.const import PATH_SEND_COMMAND
-
-        # Refresh shadow if credentials are not yet cached
-        if not self._token or not self._pin:
-            if hasattr(self._lock_device, "refresh"):
-                try:
-                    await self._lock_device.refresh()
-                except Exception as err:
-                    _LOGGER.debug("Lock refresh before unlock error: %s", err)
-            self._update_credentials_from_shadow()
-
-        token = self._token
-        pin = code or self._pin
-
-        params: dict[str, Any] = {
-            "control": "unlock",
-            "lockid": self._uuid,
-        }
-        if token:
-            params["token"] = token
-        if pin:
-            params["pin"] = pin
-
-        # Dispatch via in-home Gateway (Video Doorbell Pro / Smart Camera)
-        gw_path = PATH_SEND_COMMAND.format(
-            sp=client.sp_id,
-            unit_uuid=unit_id,
-            entity_uuid=entity_id,
-            device_uuid=target_gw,
-        )
-        gw_payload = {
-            "topic": f"/control/{unit_id}/{target_gw}/lockControl",
-            "payload": {
-                "devices": {
-                    "deviceUUID": target_gw,
-                    "services": {
-                        "lockControl": {
-                            "commands": {
-                                "lockUnlock": {
-                                    "instanceId": 0,
-                                    "parameters": params,
-                                }
-                            }
-                        }
-                    },
-                }
-            },
-        }
-
         try:
-            res = await client.request("PUT", gw_path, json_data=gw_payload)
-            _LOGGER.info("Unlock dispatched via gateway %s for lock %s: %s", target_gw, self._uuid, res)
-            # Transition to unlocked and start auto-relock timer now that command is active
-            self._is_unlocking = False
-            self._is_locked = False
-            self.async_write_ha_state()
-            self._schedule_auto_relock()
+            if hasattr(self._lock_device, "unlock"):
+                res = await self._lock_device.unlock(gateway_uuid=target_gw)
+                _LOGGER.info("Unlock dispatched via gateway %s for lock %s: %s", target_gw, self._uuid, res)
+                self._is_unlocking = False
+                self._is_locked = False
+                self.async_write_ha_state()
+                self._schedule_auto_relock()
+            else:
+                _LOGGER.error("Lock device %s missing unlock method", self._uuid)
+                self._is_unlocking = False
+                self._is_locked = True
+                self.async_write_ha_state()
         except Exception as err:
-            _LOGGER.warning("Unlock via gateway custom payload failed for lock %s (%s); trying fallback", self._uuid, err)
-            try:
-                if hasattr(self._lock_device, "unlock"):
-                    await self._lock_device.unlock(gateway_uuid=target_gw)
-                    self._is_unlocking = False
-                    self._is_locked = False
-                    self.async_write_ha_state()
-                    self._schedule_auto_relock()
-                    return
-            except Exception as fb_err:
-                _LOGGER.error("Both unlock attempts failed for lock %s: %s", self._uuid, fb_err)
+            _LOGGER.error("Unlock via gateway failed for lock %s: %s", self._uuid, err)
             self._is_unlocking = False
             self._is_locked = True
             self.async_write_ha_state()
