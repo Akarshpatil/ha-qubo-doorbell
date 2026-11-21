@@ -189,7 +189,7 @@ class MotionCapture:
                 else:
                     photo = await _grab_frame(str(url))
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Qubo motion capture failed: %s", _redact(f"{type(err).__name__}: {err}"))
+            _LOGGER.debug("Qubo motion capture stream unavailable: %s", _redact(f"{type(err).__name__}: {err}"))
         finally:
             try:
                 await self.device.stop_stream()

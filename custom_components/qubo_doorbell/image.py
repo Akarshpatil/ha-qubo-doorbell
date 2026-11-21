@@ -120,7 +120,14 @@ class QuboSnapshotImage(QuboEntity, ImageEntity):
         if ctype is None:
             _LOGGER.warning("Qubo snapshot is not a JPEG/PNG image (%d bytes)", len(data))
             return
-        await self.hass.async_add_executor_job(_write_file, self._path, data)
+        alt_path = self.hass.config.path(DOMAIN, f"{self._uuid}_snapshot.jpg")
+        def _write_both():
+            _write_file(self._path, data)
+            try:
+                _write_file(alt_path, data)
+            except Exception:
+                pass
+        await self.hass.async_add_executor_job(_write_both)
         self._image = data
         self._attr_content_type = ctype
         self._attr_image_last_updated = dt_util.utcnow()
