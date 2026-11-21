@@ -289,13 +289,6 @@ class QuboLiveCamera(QuboEntity, Camera):
                     err,
                 )
 
-            # 2. Doorbell is idle/sleeping on battery (ERR_STM_003).
-            # Provide an FFmpeg image loop of the newest snapshot so HomeKit does not crash or hang.
-            for path in (self._snapshot_path, self._legacy_snapshot_path):
-                if os.path.isfile(path) and os.path.getsize(path) > 1000:
-                    _LOGGER.info("Providing HomeKit snapshot stream for %s from %s", self.name, path)
-                    return f"-re -loop 1 -i {path}"
-
             return None
 
     async def async_will_remove_from_hass(self) -> None:

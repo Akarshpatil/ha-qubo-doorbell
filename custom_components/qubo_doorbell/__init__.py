@@ -81,9 +81,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await auth.login_with_email(
                 entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD], device_attribute="Home Assistant"
             )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Qubo re-login failed: %s", err)
+            _LOGGER.info("Qubo re-login succeeded")
+        except QuboAuthError as err:
+            _LOGGER.error("Qubo credentials rejected: %s", err)
             entry.async_start_reauth(hass)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Qubo re-login failed due to network or server outage (will retry): %s", err)
 
     listener = QuboMqttListener(
         client, unit_uuids=unit_uuids or None, loop=hass.loop, on_auth_failure=_on_auth_failure
@@ -99,9 +102,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _keep_token_fresh(_now: Any) -> None:
         try:
             await auth.get_valid_access_token()
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Qubo token refresh failed: %s", err)
+        except QuboAuthError as err:
+            _LOGGER.warning("Qubo token refresh auth error: %s", err)
             await _on_auth_failure()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Qubo token refresh deferred due to temporary connection error: %s", err)
 
     entry.async_on_unload(async_track_time_interval(hass, _keep_token_fresh, timedelta(minutes=20)))
 

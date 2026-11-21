@@ -103,6 +103,18 @@ class QuboLockEntity(QuboEntity, LockEntity):
                 self._update_credentials_from_shadow()
                 if not self._gateway_id:
                     self._gateway_id = getattr(self._lock_device, "gateway_id", None)
+                if hasattr(self._lock_device, "fetch_live_lock_state"):
+                    try:
+                        live_st = await self._lock_device.fetch_live_lock_state()
+                        if live_st:
+                            self._is_locked = (str(live_st).strip().lower() == "locked")
+                    except Exception as err:
+                        _LOGGER.debug("Could not fetch live lock state: %s", err)
+                if hasattr(self._lock_device, "fetch_live_battery"):
+                    try:
+                        await self._lock_device.fetch_live_battery()
+                    except Exception:
+                        pass
                 self.async_write_ha_state()
             except Exception as err:
                 _LOGGER.debug("Initial lock shadow refresh deferred for %s: %s", self._uuid, err)
@@ -112,6 +124,18 @@ class QuboLockEntity(QuboEntity, LockEntity):
         if not (hasattr(self._lock_device, "shadow") and hasattr(self._lock_device.shadow, "reported")):
             return
         rep = self._lock_device.shadow.reported or {}
+        st = (
+            rep.get("lockControl_lockState")
+            or (rep.get("lockControl", {}).get("lockState") if isinstance(rep.get("lockControl"), dict) else None)
+            or rep.get("lockState")
+        )
+        if st is not None:
+            s = str(st).strip().lower()
+            if s in ("locked", "lock"):
+                self._is_locked = True
+            elif s in ("unlocked", "unlock"):
+                self._is_locked = False
+
         # Dynamic token extraction
         token = (
             rep.get("token")
@@ -263,7 +287,17 @@ class QuboLockEntity(QuboEntity, LockEntity):
             self.async_write_ha_state()
             self._schedule_auto_relock()
         except Exception as err:
-            _LOGGER.error("Unlock via gateway error for lock %s: %s", self._uuid, err)
+            _LOGGER.warning("Unlock via gateway custom payload failed for lock %s (%s); trying fallback", self._uuid, err)
+            try:
+                if hasattr(self._lock_device, "unlock"):
+                    await self._lock_device.unlock(gateway_uuid=target_gw)
+                    self._is_unlocking = False
+                    self._is_locked = False
+                    self.async_write_ha_state()
+                    self._schedule_auto_relock()
+                    return
+            except Exception as fb_err:
+                _LOGGER.error("Both unlock attempts failed for lock %s: %s", self._uuid, fb_err)
             self._is_unlocking = False
             self._is_locked = True
             self.async_write_ha_state()
