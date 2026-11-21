@@ -24,41 +24,75 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.IMAGE, Platform.LOCK, Platform.CAMERA]
 
 
-def _patch_homekit_doorbell_category() -> None:
-    """Ensure HomeKit camera accessories with linked doorbells advertise as CATEGORY_VIDEO_DOOR_BELL (18).
-
-    By default, Home Assistant core's type_cameras.Camera hardcodes category=CATEGORY_CAMERA (17).
-    This prevents Apple Home from detecting the accessory as a native Video Doorbell (Robin ProLine,
-    Logitech Circle View, Belkin Wemo), hiding HomePod chime settings, doorbell notifications,
-    and native smart lock linking.
-    """
+def _patch_homekit_camera_lifecycle() -> None:
+    """Ensure HomeKit camera accessories advertise as Video Doorbell, use zero-latency settings, and release streams on close."""
     try:
         from homeassistant.components.homekit import type_cameras
-        from homeassistant.components.homekit.const import CONF_LINKED_DOORBELL_SENSOR
+        from homeassistant.components.homekit.const import (
+            CONF_AUDIO_CODEC,
+            CONF_LINKED_DOORBELL_SENSOR,
+            CONF_SUPPORT_AUDIO,
+            CONF_VIDEO_CODEC,
+        )
         from pyhap.const import CATEGORY_VIDEO_DOOR_BELL
 
         if getattr(type_cameras.Camera, "_qubo_doorbell_patched", False):
             return
 
         _orig_init = type_cameras.Camera.__init__
+        _orig_stop_stream = type_cameras.Camera.stop_stream
+        _orig_get_stream_source = type_cameras.Camera._async_get_stream_source
 
         def _doorbell_aware_init(self: Any, *args: Any, **kwargs: Any) -> None:
             _orig_init(self, *args, **kwargs)
-            if self.config.get(CONF_LINKED_DOORBELL_SENSOR):
-                self.category = CATEGORY_VIDEO_DOOR_BELL
-                _LOGGER.info(
-                    "HomeKit camera accessory '%s' configured with linked doorbell: Set category to CATEGORY_VIDEO_DOOR_BELL (18)",
-                    getattr(self, "display_name", self.entity_id),
-                )
+            is_qubo = "qubo" in getattr(self, "platform", "").lower() or "qubo" in getattr(self, "entity_id", "").lower()
+            if self.config.get(CONF_LINKED_DOORBELL_SENSOR) or is_qubo:
+                if self.config.get(CONF_LINKED_DOORBELL_SENSOR):
+                    self.category = CATEGORY_VIDEO_DOOR_BELL
+                    _LOGGER.info(
+                        "HomeKit camera accessory '%s' configured with linked doorbell: Set category to CATEGORY_VIDEO_DOOR_BELL (18)",
+                        getattr(self, "display_name", self.entity_id),
+                    )
+                # Optimize for sub-second zero-latency playback: pass native H.264 without CPU transcoding
+                if self.config.get(CONF_VIDEO_CODEC) != "copy":
+                    self.config[CONF_VIDEO_CODEC] = "copy"
+                    _LOGGER.debug("Enforced video_codec='copy' for %s for zero transcoding latency", self.entity_id)
+                self.config[CONF_SUPPORT_AUDIO] = False
+
+        async def _qubo_get_stream_source(self: Any) -> str | None:
+            src = await _orig_get_stream_source(self)
+            if not src:
+                return src
+            is_qubo = "qubo" in getattr(self, "platform", "").lower() or "qubo" in getattr(self, "entity_id", "").lower() or "qubo" in src.lower()
+            if is_qubo:
+                # Force TCP transport and zero buffering to eliminate 4-second UDP timeout
+                if "-rtsp_transport tcp" not in src:
+                    src = f"-fflags nobuffer -flags low_delay -rtsp_transport tcp -i {src}"
+            return src
+
+        async def _doorbell_aware_stop_stream(self: Any, session_info: dict[str, Any]) -> None:
+            try:
+                await _orig_stop_stream(self, session_info)
+            finally:
+                session_id = session_info.get("id")
+                try:
+                    cam_comp = self.hass.data.get("camera")
+                    entity = cam_comp.get_entity(self.entity_id) if cam_comp else None
+                    if entity and hasattr(entity, "async_release_stream"):
+                        await entity.async_release_stream(f"homekit_{session_id}")
+                except Exception as err:
+                    _LOGGER.debug("Error releasing stream from HomeKit stop_stream: %s", err)
 
         type_cameras.Camera.__init__ = _doorbell_aware_init
+        type_cameras.Camera._async_get_stream_source = _qubo_get_stream_source
+        type_cameras.Camera.stop_stream = _doorbell_aware_stop_stream
         type_cameras.Camera._qubo_doorbell_patched = True
-        _LOGGER.debug("Applied HomeKit CATEGORY_VIDEO_DOOR_BELL runtime patch")
+        _LOGGER.debug("Applied HomeKit CATEGORY_VIDEO_DOOR_BELL, low-latency & stream teardown patches")
     except Exception as err:
-        _LOGGER.debug("Could not apply HomeKit doorbell category patch: %s", err)
+        _LOGGER.debug("Could not apply HomeKit doorbell patches: %s", err)
 
 
-_patch_homekit_doorbell_category()
+_patch_homekit_camera_lifecycle()
 
 
 class QuboRuntime:
@@ -75,7 +109,7 @@ class QuboRuntime:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Log in, discover devices and start the real-time event listener."""
-    _patch_homekit_doorbell_category()
+    _patch_homekit_camera_lifecycle()
     session = async_get_clientsession(hass)
     auth = QuboAuth(device_id=entry.data[CONF_DEVICE_ID], session=session)
     try:

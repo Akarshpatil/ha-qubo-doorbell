@@ -1,4 +1,4 @@
-"""Live camera platform for Qubo Video Doorbell and cameras with instant snapshot preloading and reliable HomeKit streaming."""
+"""Live camera platform for Qubo Video Doorbell and cameras with strict single-stream concurrency and instant snapshot preloading."""
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +6,6 @@ import logging
 import os
 import shutil
 import time
-import uuid
 from typing import Any
 
 import aiohttp
@@ -18,6 +17,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from qubopy.devices.camera import QuboCamera
 
 from .const import DOMAIN, SIGNAL_EVENT, SNAPSHOT_KEYS
@@ -44,7 +44,7 @@ async def async_setup_entry(
 
 
 class QuboLiveCamera(QuboEntity, Camera):
-    """Live streaming camera entity for Qubo video doorbells with instant snapshot preloading."""
+    """Live streaming camera entity for Qubo video doorbells with strict single-stream concurrency."""
 
     _attr_has_entity_name = True
     _attr_supported_features = CameraEntityFeature.STREAM
@@ -63,6 +63,13 @@ class QuboLiveCamera(QuboEntity, Camera):
         self._last_known_event_ts: int = 0
         self._stream_lock = asyncio.Lock()
         self._last_cloud_fetch = 0.0
+
+        # Concurrency & session management
+        self._active_stream_url: str | None = None
+        self._active_stream_session: str | None = None
+        self._active_user_app_id: str | None = None
+        self._active_consumers: set[str] = set()
+        self._watchdog_unsub: Any = None
 
     async def async_added_to_hass(self) -> None:
         """Prime snapshot on boot and listen for doorbell/motion events."""
@@ -181,9 +188,6 @@ class QuboLiveCamera(QuboEntity, Camera):
                                 pass
                         await self.hass.async_add_executor_job(_save)
                         self.async_write_ha_state()
-                        self.hass.async_create_background_task(
-                            self._async_notify_mediamtx_reload(), "qubo_mediamtx_reload"
-                        )
                         _LOGGER.info("Updated Qubo snapshot for %s (%d bytes)", self.name, len(content))
                         return content
         except Exception as err:
@@ -239,9 +243,6 @@ class QuboLiveCamera(QuboEntity, Camera):
                                     pass
                             await self.hass.async_add_executor_job(_save)
                             self.async_write_ha_state()
-                            self.hass.async_create_background_task(
-                                self._async_notify_mediamtx_reload(), "qubo_mediamtx_reload"
-                            )
                             return content
         except Exception as err:
             _LOGGER.debug("Could not fetch cloud snapshot for %s: %s", self.name, err)
@@ -250,7 +251,7 @@ class QuboLiveCamera(QuboEntity, Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return the preloaded snapshot instantly for Apple Home and UI preview."""
+        """Return the preloaded snapshot instantly for Apple Home and UI preview without starting a video stream."""
         if self.stream and getattr(self.stream, "available", False):
             try:
                 frame = await self.stream.async_get_image(width=width, height=height)
@@ -260,7 +261,6 @@ class QuboLiveCamera(QuboEntity, Camera):
             except Exception as err:
                 _LOGGER.debug("Error grabbing frame from stream: %s", err)
 
-        # Check if disk has a newer image (e.g. from image.py or event download)
         disk_mtime = await self.hass.async_add_executor_job(self._get_disk_mtime_sync)
         if disk_mtime > self._last_image_mtime or not self._last_image:
             fresh = await self.hass.async_add_executor_job(self._read_disk_sync)
@@ -277,7 +277,7 @@ class QuboLiveCamera(QuboEntity, Camera):
         return self._last_image
 
     async def async_create_stream(self) -> Stream | None:
-        """Create a fresh Stream, ensuring dead or stale stream workers are reset."""
+        """Create a fresh Stream, ensuring dead or stale stream workers are reset and hooked."""
         if self.stream is not None:
             if not getattr(self.stream, "available", False):
                 try:
@@ -285,58 +285,133 @@ class QuboLiveCamera(QuboEntity, Camera):
                 except Exception:
                     pass
                 self.stream = None
-        return await super().async_create_stream()
+        stream = await super().async_create_stream()
+        if stream:
+            self._active_consumers.add("ha_dashboard")
+            orig_stop = stream.stop
 
-    async def _async_notify_mediamtx_reload(self) -> None:
-        """Notify MediaMTX to reload qubo on-demand stream with the fresh snapshot."""
-        try:
-            session = async_get_clientsession(self.hass)
-            async with session.patch(
-                "http://127.0.0.1:9997/v3/config/paths/patch/qubo",
-                json={},
-                timeout=aiohttp.ClientTimeout(total=2),
-            ) as resp:
-                if resp.status == 200:
-                    _LOGGER.debug("MediaMTX reloaded qubo live stream")
-        except Exception:
-            pass
+            async def _hooked_stop(*args: Any, **kwargs: Any) -> None:
+                try:
+                    await orig_stop(*args, **kwargs)
+                finally:
+                    await self.async_release_stream("ha_dashboard")
+
+            stream.stop = _hooked_stop
+        return stream
+
+    def _reset_watchdog(self) -> None:
+        """Reset auto-teardown watchdog timer (safety net for orphaned sessions)."""
+        if self._watchdog_unsub:
+            self._watchdog_unsub()
+            self._watchdog_unsub = None
+
+        @callback
+        def _on_timeout(_now: Any) -> None:
+            _LOGGER.info("Watchdog timer expired for Qubo live stream; auto-releasing hardware stream")
+            self.hass.async_create_background_task(
+                self.async_release_stream(), "qubo_watchdog_release"
+            )
+
+        # 3 minutes maximum streaming session before auto-release
+        self._watchdog_unsub = async_call_later(self.hass, 180, _on_timeout)
+
+    async def async_release_stream(self, consumer_id: str | None = None) -> None:
+        """Release a stream consumer and tear down Qubo hardware stream if no active viewers remain."""
+        async with self._stream_lock:
+            if consumer_id:
+                self._active_consumers.discard(consumer_id)
+                if len(self._active_consumers) == 1 and "default" in self._active_consumers:
+                    self._active_consumers.clear()
+                _LOGGER.info("Released stream consumer %s (active remaining: %s)", consumer_id, self._active_consumers)
+            else:
+                self._active_consumers.clear()
+
+            if not self._active_consumers and (self._active_stream_url or self._active_stream_session):
+                if self._watchdog_unsub:
+                    self._watchdog_unsub()
+                    self._watchdog_unsub = None
+
+                session_id = self._active_stream_session
+                user_app_id = self._active_user_app_id
+                self._active_stream_url = None
+                self._active_stream_session = None
+                self._active_user_app_id = None
+
+                _LOGGER.info("No active viewers remaining. Tearing down Qubo cloud/hardware stream session.")
+                try:
+                    # 1. v2 teardown via qubopy device
+                    if session_id:
+                        await self._cam_device.stop_stream(
+                            app_session_id=session_id, quality="high", user_app_id=user_app_id
+                        )
+                    # 2. v1 direct DELETE fallback (ensures hardware release regardless of appSessionId)
+                    client = getattr(self._cam_device, "client", None)
+                    if client and hasattr(client, "request"):
+                        app_id = user_app_id or client.auth.device_id
+                        v1_path = (
+                            f"/stream-manager/api/v1/sp/{client.sp_id}/stream/unit/"
+                            f"{self._cam_device.unit_id}/device/{self._cam_device.device_id}"
+                        )
+                        await client.request("DELETE", v1_path, params={"type": "high", "userAppID": app_id})
+                    _LOGGER.info("Successfully released Qubo stream session. Blue ring LED will extinguish.")
+                except Exception as err:
+                    _LOGGER.debug("Stream teardown completed with notice: %s", err)
 
     async def stream_source(self) -> str | None:
-        """Mint a fresh live RTSPS stream URL with fast hardware handoff or provide reliable local fallback."""
+        """Return live RTSP stream source via local P2P gateway or cloud fallback."""
+        # 1. Primary: Local P2P via MediaMTX gateway
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", 8554), timeout=1.0
+            )
+            writer.close()
+            await writer.wait_closed()
+            _LOGGER.info(
+                "Routing %s live stream through local P2P gateway (rtsp://127.0.0.1:8554/qubo_local)",
+                self.name,
+            )
+            return "rtsp://127.0.0.1:8554/qubo_local"
+        except Exception as err:
+            _LOGGER.debug("Local MediaMTX gateway not reachable at 127.0.0.1:8554: %s", err)
+
+        # 2. Secondary fallback: Cloud RTSPS stream from Qubo Cloud
         async with self._stream_lock:
-            # 1. Attempt live Wowza RTSPS stream from Qubo Cloud
+            # 1. If an active stream is already running, reuse it!
+            if self._active_stream_url:
+                _LOGGER.info(
+                    "Reusing existing live RTSPS stream for %s (consumers: %s)",
+                    self.name,
+                    self._active_consumers,
+                )
+                self._active_consumers.add("default")
+                self._reset_watchdog()
+                return self._active_stream_url
+
+            # 2. Otherwise request fresh RTSPS stream from Qubo Cloud
             try:
-                session_id = str(uuid.uuid4())
-                _LOGGER.debug("Requesting cloud RTSPS stream for %s (userAppID=%s)", self._uuid, session_id)
-                url = await self._cam_device.start_stream(quality="high", user_app_id=session_id)
+                user_app_id = f"ha_{self._uuid[:8]}"
+                _LOGGER.info("Requesting fresh cloud RTSPS stream for %s (userAppID=%s)", self.name, user_app_id)
+                url = await self._cam_device.start_stream(quality="high", user_app_id=user_app_id)
                 if url:
-                    stream_url = str(url)
+                    self._active_stream_url = str(url)
+                    self._active_stream_session = getattr(url, "app_session_id", None)
+                    self._active_user_app_id = user_app_id
+                    self._active_consumers.add("default")
+                    self._reset_watchdog()
                     if WARMUP_SECONDS > 0:
                         await asyncio.sleep(WARMUP_SECONDS)
-                    return stream_url
+                    return self._active_stream_url
             except Exception as err:
-                _LOGGER.info(
-                    "Cloud stream for %s unavailable (%s); using local fallback stream",
+                _LOGGER.warning(
+                    "Cloud stream for %s unavailable (%s). Enforcing single hardware stream exclusivity.",
                     self.name,
                     err,
                 )
-
-            # 2. Check if local mediamtx RTSP gateway is listening
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection("127.0.0.1", 8554), timeout=1.0
-                )
-                writer.close()
-                await writer.wait_closed()
-                return "rtsp://127.0.0.1:8554/qubo"
-            except Exception:
-                _LOGGER.debug("Local RTSP gateway at 127.0.0.1:8554 not reachable")
-
-            return None
+                self._active_stream_url = None
+                self._active_stream_session = None
+                self._active_user_app_id = None
+                return None
 
     async def async_will_remove_from_hass(self) -> None:
         """Tear down stream session upon entity removal."""
-        try:
-            await self._cam_device.stop_stream()
-        except Exception:
-            pass
+        await self.async_release_stream()
