@@ -117,10 +117,68 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _patch_homekit_camera_lifecycle()
     session = async_get_clientsession(hass)
     auth = QuboAuth(device_id=entry.data[CONF_DEVICE_ID], session=session)
+    cache_file = hass.config.path(".storage", "qubo_p2p_cache.json")
+    authenticated = False
+
+    # 1. Attempt fast session restoration from shared persistent cache
+    if os.path.isfile(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cdata = json.load(f)
+            c_tok = cdata.get("access_token")
+            c_ref = cdata.get("refresh_token")
+            c_uuid = cdata.get("user_uuid", "")
+            c_exp = cdata.get("expires_at", 0)
+            if c_tok and (c_exp - time.time()) > 300:
+                auth.set_tokens(access_token=c_tok, refresh_token=c_ref, user_uuid=c_uuid, expires_at=c_exp)
+                authenticated = True
+                _LOGGER.info("Restored Qubo cloud session from shared cache (valid for %ds)", int(c_exp - time.time()))
+            elif c_ref and c_uuid:
+                try:
+                    auth.set_tokens(access_token=c_tok or "", refresh_token=c_ref, user_uuid=c_uuid, expires_at=0)
+                    new_tok = await auth.refresh_session()
+                    cdata.update({
+                        "access_token": new_tok.access_token,
+                        "refresh_token": new_tok.refresh_token,
+                        "user_uuid": new_tok.user_uuid,
+                        "expires_at": new_tok.expires_at,
+                    })
+                    with open(cache_file, "w") as f:
+                        json.dump(cdata, f, indent=2)
+                    authenticated = True
+                    _LOGGER.info("Refreshed Qubo cloud session token from shared cache")
+                except Exception as err:
+                    _LOGGER.debug("Could not refresh token from shared cache: %s", err)
+        except Exception as err:
+            _LOGGER.debug("Error reading shared token cache: %s", err)
+
+    if not authenticated:
+        try:
+            tok = await auth.login_with_email(
+                entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD], device_attribute="Home Assistant"
+            )
+            try:
+                cdata = {}
+                if os.path.isfile(cache_file):
+                    with open(cache_file, "r") as f:
+                        cdata = json.load(f)
+                cdata.update({
+                    "access_token": tok.access_token,
+                    "refresh_token": tok.refresh_token,
+                    "user_uuid": tok.user_uuid,
+                    "expires_at": tok.expires_at,
+                    "email": entry.data[CONF_EMAIL],
+                })
+                with open(cache_file, "w") as f:
+                    json.dump(cdata, f, indent=2)
+            except Exception:
+                pass
+        except QuboAuthError as err:
+            raise ConfigEntryAuthFailed(f"Qubo login failed: {err}") from err
+        except (QuboConnectionError, OSError) as err:
+            raise ConfigEntryNotReady(f"Cannot reach Qubo cloud: {err}") from err
+
     try:
-        await auth.login_with_email(
-            entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD], device_attribute="Home Assistant"
-        )
         client = QuboClient(auth, session=session)
         devices = [
             d for d in await client.get_all_devices()
@@ -155,9 +213,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _on_auth_failure() -> None:
         _LOGGER.warning("Qubo session expired; re-logging in")
         try:
-            await auth.login_with_email(
+            tok = await auth.login_with_email(
                 entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD], device_attribute="Home Assistant"
             )
+            try:
+                cdata = {}
+                if os.path.isfile(cache_file):
+                    with open(cache_file, "r") as f:
+                        cdata = json.load(f)
+                cdata.update({
+                    "access_token": tok.access_token,
+                    "refresh_token": tok.refresh_token,
+                    "user_uuid": tok.user_uuid,
+                    "expires_at": tok.expires_at,
+                    "email": entry.data[CONF_EMAIL],
+                })
+                with open(cache_file, "w") as f:
+                    json.dump(cdata, f, indent=2)
+            except Exception:
+                pass
             _LOGGER.info("Qubo re-login succeeded")
         except QuboAuthError as err:
             _LOGGER.error("Qubo credentials rejected: %s", err)

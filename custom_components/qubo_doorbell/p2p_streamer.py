@@ -314,14 +314,37 @@ class QuboP2PStreamer:
                 expires_at=cached_expiry,
             )
         else:
-            _LOGGER.info("Authenticating with Qubo Cloud...")
-            payload = await auth.login_with_email(self.email, self.password, device_attribute="LocalP2PBridge")
-            self._save_cache({
-                "access_token": payload.access_token,
-                "refresh_token": payload.refresh_token,
-                "user_uuid": payload.user_uuid,
-                "expires_at": payload.expires_at,
-            })
+            token_renewed = False
+            if cached_refresh and cached_user_uuid:
+                try:
+                    _LOGGER.info("Attempting to renew session using cached refresh token...")
+                    auth.set_tokens(
+                        access_token=cached_token or "",
+                        refresh_token=cached_refresh,
+                        user_uuid=cached_user_uuid,
+                        expires_at=0,
+                    )
+                    payload = await auth.refresh_session()
+                    self._save_cache({
+                        "access_token": payload.access_token,
+                        "refresh_token": payload.refresh_token,
+                        "user_uuid": payload.user_uuid,
+                        "expires_at": payload.expires_at,
+                    })
+                    token_renewed = True
+                    _LOGGER.info("Session successfully refreshed.")
+                except Exception as err:
+                    _LOGGER.debug("Refresh token renewal deferred: %s", err)
+
+            if not token_renewed:
+                _LOGGER.info("Authenticating with Qubo Cloud via email login...")
+                payload = await auth.login_with_email(self.email, self.password, device_attribute="Home Assistant")
+                self._save_cache({
+                    "access_token": payload.access_token,
+                    "refresh_token": payload.refresh_token,
+                    "user_uuid": payload.user_uuid,
+                    "expires_at": payload.expires_at,
+                })
 
         self.client = QuboClient(auth, session=self.session)
 
@@ -446,15 +469,16 @@ class QuboP2PStreamer:
                         self.send_stun_nomination(self.camera_addr)
                         self.last_keepalive = time.time()
         finally:
-            await self.stop()
+            await self.stop(final=False)
 
-    async def stop(self) -> None:
+    async def stop(self, final: bool = True) -> None:
         """Tear down streamer and release camera hardware session."""
-        if self.stopped:
-            return
-        self.stopped = True
+        if final:
+            if self.stopped:
+                return
+            self.stopped = True
         self.running = False
-        _LOGGER.info("Stopping Qubo P2P Streamer and releasing hardware encoder...")
+        _LOGGER.info("Cleaning up Qubo P2P Streamer session...")
 
         if self.ffmpeg_proc:
             try:
@@ -504,6 +528,30 @@ class QuboP2PStreamer:
         if self.session and not self.session.closed:
             await self.session.close()
 
+    async def run_persistent(self) -> None:
+        """Run continuously in the background, automatically reconnecting on network or camera drop."""
+        backoff = 5
+        while not self.stopped:
+            try:
+                _LOGGER.info("Starting persistent P2P stream session...")
+                await self.run()
+                backoff = 5
+            except Exception as e:
+                err_str = str(e)
+                if "ERR_SM_050" in err_str:
+                    _LOGGER.warning(
+                        "Qubo login limit reached (ERR_SM_050). Maximum concurrent sessions in use. "
+                        "Please log out of other devices in the Qubo mobile app. Retrying in 60s..."
+                    )
+                    backoff = 60
+                else:
+                    _LOGGER.error("Stream session error: %s. Reconnecting in %ds...", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+            finally:
+                await self.stop(final=False)
+                await asyncio.sleep(2)
+
 
 def main() -> None:
     """CLI entrypoint with automatic discovery and zero sensitive hardcoding."""
@@ -519,6 +567,7 @@ def main() -> None:
     parser.add_argument("--rtsp-target", default=DEFAULT_RTSP_TARGET, help="RTSP publish target URL")
     parser.add_argument("--rtp-video-port", type=int, default=DEFAULT_RTP_VIDEO_PORT, help="RTP Video port (default: 5004)")
     parser.add_argument("--rtp-audio-port", type=int, default=DEFAULT_RTP_AUDIO_PORT, help="RTP Audio port (default: 5006)")
+    parser.add_argument("--persistent", action="store_true", help="Run continuously 24/7 with auto-reconnect")
 
     args = parser.parse_args()
 
@@ -529,15 +578,16 @@ def main() -> None:
     device_uuid = args.device_uuid
     config_dir = args.config_dir
 
-    if not email or not password:
+    if not email or not password or not args.device_token:
         try:
             creds = auto_load_credentials(config_dir)
             email = email or creds["email"]
             password = password or creds["password"]
-            device_token = creds.get("device_id") or device_token
+            if not args.device_token:
+                device_token = creds.get("device_id") or device_token
             device_uuid = device_uuid or creds.get("device_uuid")
             config_dir = config_dir or creds.get("config_dir")
-            _LOGGER.info("Auto-loaded credentials for: %s", email)
+            _LOGGER.info("Auto-loaded credentials for: %s (device_id: %s)", email, device_token)
         except Exception as e:
             _LOGGER.error("Failed to auto-load credentials: %s", e)
             sys.exit(1)
@@ -562,16 +612,25 @@ def main() -> None:
     def handle_signal() -> None:
         _LOGGER.info("Received stop signal, exiting streamer loop...")
         streamer.running = False
+        streamer.stopped = True
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_signal)
 
-    try:
-        loop.run_until_complete(streamer.run())
-    except Exception as e:
-        _LOGGER.error("Streamer run error: %s", e)
-    finally:
-        loop.close()
+    if args.persistent:
+        try:
+            loop.run_until_complete(streamer.run_persistent())
+        except Exception as e:
+            _LOGGER.error("Persistent streamer error: %s", e)
+        finally:
+            loop.close()
+    else:
+        try:
+            loop.run_until_complete(streamer.run())
+        except Exception as e:
+            _LOGGER.error("Streamer run error: %s", e)
+        finally:
+            loop.close()
 
 
 if __name__ == "__main__":
