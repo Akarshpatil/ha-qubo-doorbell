@@ -73,6 +73,19 @@ def get_default_local_ip() -> str:
         return "127.0.0.1"
 
 
+def notify_systemd_watchdog() -> None:
+    """Send keepalive heartbeat to systemd watchdog if configured."""
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            target = "\0" + notify_socket[1:] if notify_socket.startswith("@") else notify_socket
+            s.sendto(b"WATCHDOG=1", target.encode() if isinstance(target, str) else target)
+    except Exception:
+        pass
+
+
 def find_ha_config_dir() -> str | None:
     """Locate Home Assistant configuration directory."""
     candidates = [
@@ -299,13 +312,13 @@ class QuboP2PStreamer:
         self.session = aiohttp.ClientSession()
         auth = QuboAuth(device_id=self.device_id, session=self.session)
 
-        # Fast path: Check cached access token validity (> 300s remaining)
+        # Fast path: Check cached access token validity (> 900s / 15m remaining)
         cached_token = cache.get("access_token")
         cached_refresh = cache.get("refresh_token")
         cached_user_uuid = cache.get("user_uuid", "")
         cached_expiry = cache.get("expires_at", 0)
 
-        if cached_token and (cached_expiry - time.time()) > 300:
+        if cached_token and (cached_expiry - time.time()) > 900:
             _LOGGER.info("Using cached Qubo authentication token (valid for %ds)", int(cached_expiry - time.time()))
             auth.set_tokens(
                 access_token=cached_token,
@@ -393,9 +406,34 @@ class QuboP2PStreamer:
         self.start_ffmpeg()
         loop = asyncio.get_running_loop()
         first_frame = True
+        last_media_time = time.time()
+        last_watchdog_ping = 0.0
 
         try:
             while self.running:
+                now = time.time()
+
+                # 1. Health check: verify FFmpeg publisher is still alive
+                if self.ffmpeg_proc and self.ffmpeg_proc.poll() is not None:
+                    _LOGGER.warning("FFmpeg publisher process exited with code %d. Reconnecting...", self.ffmpeg_proc.returncode)
+                    self.running = False
+                    break
+
+                # 2. Watchdog: check for media stream silence (camera dropped, rebooted, or session expired)
+                silence_limit = 5.0 if not first_frame else 15.0
+                if (now - last_media_time) > silence_limit:
+                    _LOGGER.warning(
+                        "Media stream silence detected (no packets received for %.1fs). Re-establishing P2P session...",
+                        now - last_media_time,
+                    )
+                    self.running = False
+                    break
+
+                # 3. Systemd watchdog keepalive
+                if not first_frame and (now - last_watchdog_ping) > 5.0:
+                    notify_systemd_watchdog()
+                    last_watchdog_ping = now
+
                 try:
                     data, addr = await asyncio.wait_for(loop.sock_recvfrom(self.sock, 65535), timeout=0.5)
                     self.camera_addr = addr
@@ -467,6 +505,7 @@ class QuboP2PStreamer:
                                         break
 
                             if plaintext is not None:
+                                last_media_time = now
                                 if first_frame:
                                     _LOGGER.info("First H.264 video RTP packet decrypted. Live stream established!")
                                     first_frame = False
@@ -502,6 +541,7 @@ class QuboP2PStreamer:
                             try:
                                 plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
                                 if plaintext and self.out_sock:
+                                    last_media_time = now
                                     self.out_sock.sendto(
                                         data[:12] + plaintext, ("127.0.0.1", self.rtp_audio_port)
                                     )
@@ -584,12 +624,23 @@ class QuboP2PStreamer:
 
     async def run_persistent(self) -> None:
         """Run continuously in the background, automatically reconnecting on network or camera drop."""
-        backoff = 5
+        backoff = 2
         while not self.stopped:
             try:
                 _LOGGER.info("Starting persistent P2P stream session...")
+                # Reset ephemeral cryptographic and stream state for fresh session
+                self.key = os.urandom(16)
+                self.iv = os.urandom(16)
+                self.aesgcm = AESGCM(self.key)
+                self.user_app_id = f"ha_p2p_{os.urandom(4).hex()}"
+                self.camera_addr = None
+                self.last_seq = None
+                self.roc = 0
+                self._roc_locked = False
+                self._err_count = 0
+
                 await self.run()
-                backoff = 5
+                backoff = 2
             except Exception as e:
                 err_str = str(e)
                 if "ERR_SM_050" in err_str:
@@ -598,13 +649,18 @@ class QuboP2PStreamer:
                         "Please log out of other devices in the Qubo mobile app. Retrying in 60s..."
                     )
                     backoff = 60
+                elif "ERR_STM_003" in err_str:
+                    _LOGGER.info(
+                        "Device stream limit reached (ERR_STM_003). Camera is in use by Qubo app/Alexa. Retrying in 5s..."
+                    )
+                    backoff = 5
                 else:
                     _LOGGER.error("Stream session error: %s. Reconnecting in %ds...", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             finally:
                 await self.stop(final=False)
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
 
 
 def main() -> None:
