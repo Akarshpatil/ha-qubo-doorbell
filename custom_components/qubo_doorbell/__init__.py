@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import timedelta
+import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -120,11 +122,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     cache_file = hass.config.path(".storage", "qubo_p2p_cache.json")
     authenticated = False
 
-    # 1. Attempt fast session restoration from shared persistent cache
-    if os.path.isfile(cache_file):
+    def _read_cache_sync() -> dict[str, Any]:
+        if os.path.isfile(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _write_cache_sync(data_to_write: dict[str, Any]) -> None:
         try:
-            with open(cache_file, "r") as f:
-                cdata = json.load(f)
+            with open(cache_file, "w") as f:
+                json.dump(data_to_write, f, indent=2)
+        except Exception as err:
+            _LOGGER.debug("Could not write cache file: %s", err)
+
+    # 1. Attempt fast session restoration from shared persistent cache
+    cdata = await hass.async_add_executor_job(_read_cache_sync)
+    if cdata:
+        try:
             c_tok = cdata.get("access_token")
             c_ref = cdata.get("refresh_token")
             c_uuid = cdata.get("user_uuid", "")
@@ -143,8 +160,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "user_uuid": new_tok.user_uuid,
                         "expires_at": new_tok.expires_at,
                     })
-                    with open(cache_file, "w") as f:
-                        json.dump(cdata, f, indent=2)
+                    await hass.async_add_executor_job(_write_cache_sync, cdata)
                     authenticated = True
                     _LOGGER.info("Refreshed Qubo cloud session token from shared cache")
                 except Exception as err:
@@ -157,22 +173,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             tok = await auth.login_with_email(
                 entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD], device_attribute="Home Assistant"
             )
-            try:
-                cdata = {}
-                if os.path.isfile(cache_file):
-                    with open(cache_file, "r") as f:
-                        cdata = json.load(f)
-                cdata.update({
-                    "access_token": tok.access_token,
-                    "refresh_token": tok.refresh_token,
-                    "user_uuid": tok.user_uuid,
-                    "expires_at": tok.expires_at,
-                    "email": entry.data[CONF_EMAIL],
-                })
-                with open(cache_file, "w") as f:
-                    json.dump(cdata, f, indent=2)
-            except Exception:
-                pass
+            cdata = await hass.async_add_executor_job(_read_cache_sync)
+            cdata.update({
+                "access_token": tok.access_token,
+                "refresh_token": tok.refresh_token,
+                "user_uuid": tok.user_uuid,
+                "expires_at": tok.expires_at,
+                "email": entry.data[CONF_EMAIL],
+            })
+            await hass.async_add_executor_job(_write_cache_sync, cdata)
         except QuboAuthError as err:
             raise ConfigEntryAuthFailed(f"Qubo login failed: {err}") from err
         except (QuboConnectionError, OSError) as err:
@@ -216,22 +225,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             tok = await auth.login_with_email(
                 entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD], device_attribute="Home Assistant"
             )
-            try:
-                cdata = {}
-                if os.path.isfile(cache_file):
-                    with open(cache_file, "r") as f:
-                        cdata = json.load(f)
-                cdata.update({
-                    "access_token": tok.access_token,
-                    "refresh_token": tok.refresh_token,
-                    "user_uuid": tok.user_uuid,
-                    "expires_at": tok.expires_at,
-                    "email": entry.data[CONF_EMAIL],
-                })
-                with open(cache_file, "w") as f:
-                    json.dump(cdata, f, indent=2)
-            except Exception:
-                pass
+            cdata = await hass.async_add_executor_job(_read_cache_sync)
+            cdata.update({
+                "access_token": tok.access_token,
+                "refresh_token": tok.refresh_token,
+                "user_uuid": tok.user_uuid,
+                "expires_at": tok.expires_at,
+                "email": entry.data[CONF_EMAIL],
+            })
+            await hass.async_add_executor_job(_write_cache_sync, cdata)
             _LOGGER.info("Qubo re-login succeeded")
         except QuboAuthError as err:
             _LOGGER.error("Qubo credentials rejected: %s", err)
