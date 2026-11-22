@@ -420,26 +420,80 @@ class QuboP2PStreamer:
                         # Track video stream (PT 96: H.264 Baseline)
                         if pt == 96:
                             seq = struct.unpack("!H", data[2:4])[0]
+                            plaintext = None
+
+                            # 1. Try estimated ROC using RFC 3711 index calculation
                             if self.last_seq is not None:
-                                if seq < self.last_seq and (self.last_seq - seq) > 30000:
-                                    self.roc += 1
-                            self.last_seq = seq
+                                if self.last_seq < 32768:
+                                    v = self.roc - 1 if (seq - self.last_seq) > 32768 and self.roc > 0 else self.roc
+                                else:
+                                    v = self.roc + 1 if (self.last_seq - 32768) > seq else self.roc
+                            else:
+                                v = self.roc
 
-                            temp_iv = data[:12] + struct.pack("!I", self.roc)
-                            derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
+                            for endian in getattr(self, "_endian_candidates", ("<I", "!I")):
+                                temp_iv = data[:12] + struct.pack(endian, v)
+                                derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
+                                try:
+                                    plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
+                                    self._endian_candidates = (endian,)
+                                    break
+                                except Exception:
+                                    pass
 
-                            try:
-                                plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
-                                if plaintext:
-                                    if first_frame:
-                                        _LOGGER.info("First H.264 video RTP packet decrypted. Live stream established!")
-                                        first_frame = False
-                                    if self.out_sock:
-                                        self.out_sock.sendto(
-                                            data[:12] + plaintext, ("127.0.0.1", self.rtp_video_port)
-                                        )
-                            except Exception:
-                                pass
+                            # 2. Fast scan if not yet locked on initial stream start or drift
+                            if plaintext is None:
+                                scan_range = range(200) if not getattr(self, "_roc_locked", False) else [v - 1, v + 1, v + 2]
+                                for test_roc in scan_range:
+                                    if test_roc < 0 or test_roc == v:
+                                        continue
+                                    for endian in ("<I", "!I"):
+                                        temp_iv = data[:12] + struct.pack(endian, test_roc)
+                                        derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
+                                        try:
+                                            plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
+                                            _LOGGER.info(
+                                                "Locked on video ROC=%d (endian=%s) for seq=%d",
+                                                test_roc, endian, seq
+                                            )
+                                            self.roc = test_roc
+                                            self._endian_candidates = (endian,)
+                                            self._roc_locked = True
+                                            v = test_roc
+                                            break
+                                        except Exception:
+                                            pass
+                                    if plaintext is not None:
+                                        break
+
+                            if plaintext is not None:
+                                if first_frame:
+                                    _LOGGER.info("First H.264 video RTP packet decrypted. Live stream established!")
+                                    first_frame = False
+
+                                # Update SRTP highest index
+                                if self.last_seq is None:
+                                    self.last_seq = seq
+                                    self.roc = v
+                                    self._roc_locked = True
+                                else:
+                                    if v > self.roc or (v == self.roc and seq > self.last_seq):
+                                        self.last_seq = seq
+                                        self.roc = v
+
+                                if self.out_sock:
+                                    self.out_sock.sendto(
+                                        data[:12] + plaintext, ("127.0.0.1", self.rtp_video_port)
+                                    )
+                            else:
+                                if not hasattr(self, "_err_count"):
+                                    self._err_count = 0
+                                self._err_count += 1
+                                if self._err_count <= 5 or self._err_count % 100 == 0:
+                                    _LOGGER.warning(
+                                        "Video decryption failed (roc=%d, seq=%d, len=%d)",
+                                        self.roc, seq, len(data)
+                                    )
 
                         # Track audio stream (PT 97: AAC-LC 16kHz)
                         elif pt == 97:
