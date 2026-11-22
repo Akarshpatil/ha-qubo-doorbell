@@ -416,6 +416,17 @@ class QuboP2PStreamer:
             self.local_port,
         )
 
+        # Drain any lingering UDP packets from previous sessions
+        drained = 0
+        while True:
+            try:
+                self.sock.recvfrom(65535)
+                drained += 1
+            except (BlockingIOError, InterruptedError):
+                break
+        if drained:
+            _LOGGER.debug("Drained %d stale UDP packets before starting stream", drained)
+
         self.start_ffmpeg()
         loop = asyncio.get_running_loop()
         first_video_frame = True
@@ -493,14 +504,20 @@ class QuboP2PStreamer:
                             except Exception:
                                 plaintext = None
 
-                            # Fast adaptive scan only if first frame failed (e.g. non-zero ROC from camera)
-                            if plaintext is None and first_video_frame:
-                                for test_roc in range(1, 100):
+                            # Fast adaptive scan if decryption failed (e.g. sequence wrap, out-of-order, or camera ROC reset)
+                            if plaintext is None:
+                                candidates = [0] if self.roc != 0 else []
+                                if self.roc > 0:
+                                    candidates.append(self.roc - 1)
+                                candidates.append(self.roc + 1)
+                                if first_video_frame:
+                                    candidates.extend(range(2, 50))
+                                for test_roc in candidates:
                                     t_iv = data[:12] + struct.pack("!I", test_roc)
                                     d_iv = bytes([a ^ b for a, b in zip(self.iv, t_iv)])
                                     try:
                                         plaintext = self.aesgcm.decrypt(d_iv, ciphertext + tag, aad)
-                                        _LOGGER.info("Locked on video ROC=%d for seq=%d", test_roc, seq)
+                                        _LOGGER.info("Recovered video decryption with ROC=%d for seq=%d", test_roc, seq)
                                         self.roc = test_roc
                                         break
                                     except Exception:
@@ -518,18 +535,19 @@ class QuboP2PStreamer:
                                         data[:12] + plaintext, ("127.0.0.1", self.rtp_video_port)
                                     )
                             else:
-                                consecutive_video_errors += 1
-                                if consecutive_video_errors <= 5 or consecutive_video_errors % 100 == 0:
-                                    _LOGGER.warning(
-                                        "Video decryption failed (roc=%d, seq=%d, len=%d, consecutive_errs=%d)",
-                                        self.roc, seq, len(data), consecutive_video_errors,
-                                    )
-                                if consecutive_video_errors >= 25:
-                                    _LOGGER.warning(
-                                        "Exceeded 25 consecutive video decryption failures. Reconnecting P2P session..."
-                                    )
-                                    self.running = False
-                                    break
+                                if not first_video_frame:
+                                    consecutive_video_errors += 1
+                                    if consecutive_video_errors <= 5 or consecutive_video_errors % 50 == 0:
+                                        _LOGGER.warning(
+                                            "Video decryption failed (roc=%d, seq=%d, len=%d, consecutive_errs=%d)",
+                                            self.roc, seq, len(data), consecutive_video_errors,
+                                        )
+                                    if consecutive_video_errors >= 150:
+                                        _LOGGER.warning(
+                                            "Exceeded 150 consecutive video decryption failures. Reconnecting P2P session..."
+                                        )
+                                        self.running = False
+                                        break
 
                         # Track audio stream (PT 97: AAC-LC 16kHz)
                         elif pt == 97:
