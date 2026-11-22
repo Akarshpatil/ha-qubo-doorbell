@@ -361,6 +361,19 @@ class QuboP2PStreamer:
 
         self.client = QuboClient(auth, session=self.session)
 
+        # Hook auth.refresh_session to immediately persist refreshed tokens to disk cache
+        orig_refresh = auth.refresh_session
+        async def _wrapped_refresh(*args: Any, **kwargs: Any) -> Any:
+            payload = await orig_refresh(*args, **kwargs)
+            self._save_cache({
+                "access_token": payload.access_token,
+                "refresh_token": payload.refresh_token,
+                "user_uuid": payload.user_uuid,
+                "expires_at": payload.expires_at,
+            })
+            return payload
+        auth.refresh_session = _wrapped_refresh
+
         # Auto-discover unit & device UUID if not present
         if not self.unit_uuid or not self.device_uuid:
             _LOGGER.info("Discovering Qubo doorbell UUIDs from account...")
@@ -405,9 +418,11 @@ class QuboP2PStreamer:
 
         self.start_ffmpeg()
         loop = asyncio.get_running_loop()
-        first_frame = True
-        last_media_time = time.time()
+        first_video_frame = True
+        last_video_time = time.time()
+        last_audio_time = time.time()
         last_watchdog_ping = 0.0
+        consecutive_video_errors = 0
 
         try:
             while self.running:
@@ -415,22 +430,26 @@ class QuboP2PStreamer:
 
                 # 1. Health check: verify FFmpeg publisher is still alive
                 if self.ffmpeg_proc and self.ffmpeg_proc.poll() is not None:
-                    _LOGGER.warning("FFmpeg publisher process exited with code %d. Reconnecting...", self.ffmpeg_proc.returncode)
-                    self.running = False
-                    break
-
-                # 2. Watchdog: check for media stream silence (camera dropped, rebooted, or session expired)
-                silence_limit = 5.0 if not first_frame else 15.0
-                if (now - last_media_time) > silence_limit:
                     _LOGGER.warning(
-                        "Media stream silence detected (no packets received for %.1fs). Re-establishing P2P session...",
-                        now - last_media_time,
+                        "FFmpeg publisher process exited with code %d. Reconnecting...",
+                        self.ffmpeg_proc.returncode,
                     )
                     self.running = False
                     break
 
-                # 3. Systemd watchdog keepalive
-                if not first_frame and (now - last_watchdog_ping) > 5.0:
+                # 2. Watchdog: check for VIDEO media stream silence (camera dropped, rebooted, or session expired)
+                # Video silence threshold: 15.0s during initial handshake, 5.0s during steady state
+                video_silence_limit = 15.0 if first_video_frame else 5.0
+                if (now - last_video_time) > video_silence_limit:
+                    _LOGGER.warning(
+                        "Video media stream silence detected (no video decrypted for %.1fs). Re-establishing P2P session...",
+                        now - last_video_time,
+                    )
+                    self.running = False
+                    break
+
+                # 3. Systemd watchdog keepalive (only ping systemd when video is actively flowing)
+                if not first_video_frame and (now - last_watchdog_ping) > 5.0:
                     notify_systemd_watchdog()
                     last_watchdog_ping = now
 
@@ -458,81 +477,59 @@ class QuboP2PStreamer:
                         # Track video stream (PT 96: H.264 Baseline)
                         if pt == 96:
                             seq = struct.unpack("!H", data[2:4])[0]
-                            plaintext = None
-
-                            # 1. Try estimated ROC using RFC 3711 index calculation
+                            # Rollover counter tracking
                             if self.last_seq is not None:
-                                if self.last_seq < 32768:
-                                    v = self.roc - 1 if (seq - self.last_seq) > 32768 and self.roc > 0 else self.roc
-                                else:
-                                    v = self.roc + 1 if (self.last_seq - 32768) > seq else self.roc
-                            else:
-                                v = self.roc
+                                if seq < 10000 and self.last_seq > 55000:
+                                    self.roc += 1
+                                elif seq > 55000 and self.last_seq < 10000 and self.roc > 0:
+                                    self.roc -= 1
+                            self.last_seq = seq
 
-                            for endian in getattr(self, "_endian_candidates", ("<I", "!I")):
-                                temp_iv = data[:12] + struct.pack(endian, v)
-                                derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
-                                try:
-                                    plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
-                                    self._endian_candidates = (endian,)
-                                    break
-                                except Exception:
-                                    pass
+                            temp_iv = data[:12] + struct.pack("!I", self.roc)
+                            derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
 
-                            # 2. Fast scan if not yet locked on initial stream start or drift
-                            if plaintext is None:
-                                scan_range = range(200) if not getattr(self, "_roc_locked", False) else [v - 1, v + 1, v + 2]
-                                for test_roc in scan_range:
-                                    if test_roc < 0 or test_roc == v:
-                                        continue
-                                    for endian in ("<I", "!I"):
-                                        temp_iv = data[:12] + struct.pack(endian, test_roc)
-                                        derived_iv = bytes([a ^ b for a, b in zip(self.iv, temp_iv)])
-                                        try:
-                                            plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
-                                            _LOGGER.info(
-                                                "Locked on video ROC=%d (endian=%s) for seq=%d",
-                                                test_roc, endian, seq
-                                            )
-                                            self.roc = test_roc
-                                            self._endian_candidates = (endian,)
-                                            self._roc_locked = True
-                                            v = test_roc
-                                            break
-                                        except Exception:
-                                            pass
-                                    if plaintext is not None:
+                            try:
+                                plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
+                            except Exception:
+                                plaintext = None
+
+                            # Fast adaptive scan only if first frame failed (e.g. non-zero ROC from camera)
+                            if plaintext is None and first_video_frame:
+                                for test_roc in range(1, 100):
+                                    t_iv = data[:12] + struct.pack("!I", test_roc)
+                                    d_iv = bytes([a ^ b for a, b in zip(self.iv, t_iv)])
+                                    try:
+                                        plaintext = self.aesgcm.decrypt(d_iv, ciphertext + tag, aad)
+                                        _LOGGER.info("Locked on video ROC=%d for seq=%d", test_roc, seq)
+                                        self.roc = test_roc
                                         break
+                                    except Exception:
+                                        pass
 
                             if plaintext is not None:
-                                last_media_time = now
-                                if first_frame:
+                                consecutive_video_errors = 0
+                                last_video_time = now
+                                if first_video_frame:
                                     _LOGGER.info("First H.264 video RTP packet decrypted. Live stream established!")
-                                    first_frame = False
-
-                                # Update SRTP highest index
-                                if self.last_seq is None:
-                                    self.last_seq = seq
-                                    self.roc = v
-                                    self._roc_locked = True
-                                else:
-                                    if v > self.roc or (v == self.roc and seq > self.last_seq):
-                                        self.last_seq = seq
-                                        self.roc = v
+                                    first_video_frame = False
 
                                 if self.out_sock:
                                     self.out_sock.sendto(
                                         data[:12] + plaintext, ("127.0.0.1", self.rtp_video_port)
                                     )
                             else:
-                                if not hasattr(self, "_err_count"):
-                                    self._err_count = 0
-                                self._err_count += 1
-                                if self._err_count <= 5 or self._err_count % 100 == 0:
+                                consecutive_video_errors += 1
+                                if consecutive_video_errors <= 5 or consecutive_video_errors % 100 == 0:
                                     _LOGGER.warning(
-                                        "Video decryption failed (roc=%d, seq=%d, len=%d)",
-                                        self.roc, seq, len(data)
+                                        "Video decryption failed (roc=%d, seq=%d, len=%d, consecutive_errs=%d)",
+                                        self.roc, seq, len(data), consecutive_video_errors,
                                     )
+                                if consecutive_video_errors >= 25:
+                                    _LOGGER.warning(
+                                        "Exceeded 25 consecutive video decryption failures. Reconnecting P2P session..."
+                                    )
+                                    self.running = False
+                                    break
 
                         # Track audio stream (PT 97: AAC-LC 16kHz)
                         elif pt == 97:
@@ -541,7 +538,7 @@ class QuboP2PStreamer:
                             try:
                                 plaintext = self.aesgcm.decrypt(derived_iv, ciphertext + tag, aad)
                                 if plaintext and self.out_sock:
-                                    last_media_time = now
+                                    last_audio_time = now
                                     self.out_sock.sendto(
                                         data[:12] + plaintext, ("127.0.0.1", self.rtp_audio_port)
                                     )
@@ -619,8 +616,19 @@ class QuboP2PStreamer:
             except Exception as e:
                 _LOGGER.debug("Teardown notice: %s", e)
 
+        # Also persist refreshed tokens if client is active
+        if self.client and hasattr(self.client, "auth") and self.client.auth and self.client.auth.tokens:
+            tokens = self.client.auth.tokens
+            self._save_cache({
+                "access_token": tokens.access_token,
+                "refresh_token": tokens.refresh_token,
+                "user_uuid": tokens.user_uuid,
+                "expires_at": tokens.expires_at,
+            })
+
         if self.session and not self.session.closed:
             await self.session.close()
+            self.session = None
 
     async def run_persistent(self) -> None:
         """Run continuously in the background, automatically reconnecting on network or camera drop."""
@@ -636,8 +644,6 @@ class QuboP2PStreamer:
                 self.camera_addr = None
                 self.last_seq = None
                 self.roc = 0
-                self._roc_locked = False
-                self._err_count = 0
 
                 await self.run()
                 backoff = 2
@@ -660,7 +666,8 @@ class QuboP2PStreamer:
                 backoff = min(backoff * 2, 60)
             finally:
                 await self.stop(final=False)
-                await asyncio.sleep(1)
+                # Cooldown so camera hardware encoder releases cleanly before new session offer
+                await asyncio.sleep(1.5)
 
 
 def main() -> None:
